@@ -1,0 +1,8 @@
+[package]
+name = "peerington"
+version = "0.1.0"
+authors = ["Martin Grabmueller <martin@grabmueller.de>"]
+
+[dependencies]
+uuid = { version = "0.2", features = ["v4"] }
+getopts = "0.2"
