@@ -6,10 +6,15 @@ extern crate uuid;
 extern crate getopts;
 
 use uuid::Uuid;
-use uuid::ParseError;
+//use uuid::ParseError;
 use getopts::Options;
-use getopts::Fail;
+//use getopts::Fail;
 use std::fmt;
+use std::io::Write;
+use std::io::Read;
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::thread;
 
 /// Print a usage summary to stdout that describes the command syntax.
 pub fn print_usage(program: &str, opts: Options) {
@@ -130,9 +135,70 @@ pub fn parse_opts(args: Vec<String>) -> Result<Config, ConfigError> {
     };
 }
 
+fn handler(stream: &mut TcpStream) {
+    if let Ok(peer) = stream.peer_addr() {
+        println!("connection from {}", peer);
+    } else {
+        println!("connection attempt");
+    }
+    let mut buf = [33; 1024];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) =>
+                break,
+            Ok(n) => {
+                match stream.write(&buf[0..n]) {
+                    Ok(x) =>
+                        if x != n {
+                            println!("could not write everything");
+                            break;
+                        },
+                    Err(e) => {
+                        println!("error when writing: {}", e);
+                    }
+                }
+            },
+            Err(e) => {
+                println!("error when reading: {}", e);
+                break;
+            }
+        }
+    }
+}
+
+fn listener(addr: String) {
+    match TcpListener::bind(addr.as_str()) {
+        Ok(listener) => {
+            println!("listening on {}", listener.local_addr().unwrap());
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(mut stream) => {
+                        thread::spawn(move || {
+                            handler(&mut stream);
+                        });
+                    },
+                    Err(e) =>
+                        println!("error when accepting connection to {}: {}",
+                                 addr, e)
+                }
+            }
+        },
+        Err(e) => {
+            println!("error when binding to {}: {}", addr, e);
+        }
+    }
+}
+
+pub fn start_listeners(config: &Config) {
+    for addr in config.listen_addresses.clone() {
+        let a = addr.clone();
+        thread::spawn(move || listener(a));
+    }
+}
+
 mod test {
-    use super::parse_opts;
-    use super::ConfigError;
+    #[allow(unused_imports)]
+    use super::*;
     
     #[test]
     fn no_listen() {
