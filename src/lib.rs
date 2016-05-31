@@ -1,25 +1,47 @@
-// Copyright 2016 The Martin Grabmueller. See the LICENSE file at the
+// Copyright 2016 Martin Grabmueller. See the LICENSE file at the
 // top-level directory of this distribution for license information.
 //
 
 extern crate uuid;
 extern crate getopts;
+extern crate openssl;
 
 use uuid::Uuid;
-//use uuid::ParseError;
 use getopts::Options;
-//use getopts::Fail;
-use std::fmt;
+use openssl::ssl;
+
+//use std::fmt;
 use std::io::Write;
 use std::io::Read;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::thread;
 
+mod error;
+
 /// Print a usage summary to stdout that describes the command syntax.
 pub fn print_usage(program: &str, opts: Options) {
     let brief = format!("Usage: {} FILE [options]", program);
     print!("{}", opts.usage(&brief));
+}
+
+pub struct NodeState {
+    ssl_context: ssl::SslContext
+}
+
+impl NodeState {
+    pub fn new(config: &Config) -> Result<NodeState, error::Error> {
+        let mut ssl_context = try!(ssl::SslContext::new(ssl::SslMethod::Tlsv1));
+
+        let mut ca_path = config.workspace_dir.clone();
+        ca_path.push_str("/ca-chain.cert.pem");
+
+        ssl_context.set_CA_file(&ca_path);
+   
+        Ok(NodeState {
+            ssl_context: ssl_context
+        })
+    }
 }
 
 /// Configuration of a peerington node.
@@ -36,45 +58,9 @@ pub struct Config {
     pub workspace_dir: String
 }
 
-/// Error values returned from the command line option parser.
-pub enum ConfigError {
-    /// The user has given the `-h' or `--help' options.
-    HelpRequested(getopts::Options),
-    /// No listen address was specified.
-    NoListenAddress,
-    /// No workspace directory was specified.
-    NoWorkspace,
-    /// No UUID was specified.
-    NoUuid,
-    /// The UUID given could not be parsed.
-    InvalidUuid(uuid::ParseError),
-    /// Some error during option parsing happened, for example an
-    /// invalid option was given.
-    GetOptError(getopts::Fail)
-}
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            ConfigError::HelpRequested(_) =>
-                write!(f, "help requested"),
-            ConfigError::NoListenAddress =>
-                write!(f, "no listen address given"),
-            ConfigError::NoWorkspace =>
-                write!(f, "no workspace directory given"),
-            ConfigError::NoUuid =>
-                write!(f, "no node UUID given"),
-            ConfigError::InvalidUuid(e) =>
-                write!(f, "UUID is invalid: {}", e),
-            ConfigError::GetOptError(ref e) =>
-                write!(f, "{}", e)
-        }
-    }
-}
-
 /// Parse allowed options for a peerington node.  Either return a
 /// complete `Config' value or an error value.
-pub fn parse_opts(args: Vec<String>) -> Result<Config, ConfigError> {
+pub fn parse_opts(args: Vec<String>) -> Result<Config, error::ConfigError> {
 
     let mut opts = Options::new();
     opts.optopt("u", "uuid", "set node uuid", "UUID");
@@ -86,13 +72,13 @@ pub fn parse_opts(args: Vec<String>) -> Result<Config, ConfigError> {
     match opts.parse(&args[1..]) {
         Ok(matches) => { 
             if matches.opt_present("h") {
-                return Err(ConfigError::HelpRequested(opts));
+                return Err(error::ConfigError::HelpRequested(opts));
             }
 
             let addresses = if matches.opt_present("l") {
                 matches.opt_strs("l")
             } else {
-                return Err(ConfigError::NoListenAddress);
+                return Err(error::ConfigError::NoListenAddress);
             };
 
             let seeds = matches.opt_strs("s");
@@ -101,7 +87,7 @@ pub fn parse_opts(args: Vec<String>) -> Result<Config, ConfigError> {
                 match matches.opt_str("w") {
                     Some(w) => w,
                     None => {
-                        return Err(ConfigError::NoWorkspace);
+                        return Err(error::ConfigError::NoWorkspace);
                     }
                 };
 
@@ -113,12 +99,12 @@ pub fn parse_opts(args: Vec<String>) -> Result<Config, ConfigError> {
                                 u
                             }
                             Err(e) => {
-                                return Err(ConfigError::InvalidUuid(e));
+                                return Err(error::ConfigError::InvalidUuid(e));
                             }
                         }
                     },
                     None => {
-                        return Err(ConfigError::NoUuid);
+                        return Err(error::ConfigError::NoUuid);
                     }
                 };
 
@@ -130,7 +116,7 @@ pub fn parse_opts(args: Vec<String>) -> Result<Config, ConfigError> {
             });
         }
         Err(f) => {
-            return Err(ConfigError::GetOptError(f));
+            return Err(error::ConfigError::GetOptError(f));
         }
     };
 }
