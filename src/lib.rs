@@ -11,15 +11,15 @@ extern crate openssl;
 use uuid::Uuid;
 use getopts::Options;
 use openssl::ssl;
+use openssl::x509;
 
-//use std::fmt;
 use std::io::Write;
 use std::io::Read;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::thread;
 
-mod error;
+pub mod error;
 
 /// Print a usage summary to stdout that describes the command syntax.
 pub fn print_usage(program: &str, opts: Options) {
@@ -28,7 +28,7 @@ pub fn print_usage(program: &str, opts: Options) {
 }
 
 pub struct NodeState {
-    ssl_context: ssl::SslContext
+    pub ssl_context: ssl::SslContext
 }
 
 impl NodeState {
@@ -38,8 +38,27 @@ impl NodeState {
         let mut ca_path = config.workspace_dir.clone();
         ca_path.push_str("/ca-chain.cert.pem");
 
-        ssl_context.set_CA_file(&ca_path);
+        trace!("setting ca file");
+        try!(ssl_context.set_CA_file(&ca_path));
    
+        let mut cert_path = config.workspace_dir.clone();
+        cert_path.push_str("/");
+        cert_path.push_str(&config.uuid.to_string());
+        cert_path.push_str(".cert.pem");
+
+        trace!("setting certificate file");
+        try!(ssl_context.set_certificate_file(&cert_path, x509::X509FileType::PEM));
+   
+        let mut priv_key_path = config.workspace_dir.clone();
+        priv_key_path.push_str("/");
+        priv_key_path.push_str(&config.uuid.to_string());
+        priv_key_path.push_str(".key.pem");
+
+        trace!("setting private key file");
+        try!(ssl_context.set_private_key_file(&priv_key_path,
+                                              x509::X509FileType::PEM));
+        try!(ssl_context.check_private_key());
+        
         Ok(NodeState {
             ssl_context: ssl_context
         })
@@ -123,19 +142,19 @@ pub fn parse_opts(args: Vec<String>) -> Result<Config, error::ConfigError> {
     };
 }
 
-fn handler(stream: &mut TcpStream) {
-    if let Ok(peer) = stream.peer_addr() {
+fn handler(stream: &mut ssl::SslStream<TcpStream>) {
+    if let Ok(peer) = stream.get_ref().peer_addr() {
         info!("connection from {}", peer);
     } else {
         info!("connection attempt");
     }
     let mut buf = [33; 1024];
     loop {
-        match stream.read(&mut buf) {
+        match stream.ssl_read(&mut buf) {
             Ok(0) =>
                 break,
             Ok(n) => {
-                match stream.write(&buf[0..n]) {
+                match stream.ssl_write(&buf[0..n]) {
                     Ok(x) =>
                         if x != n {
                             error!("could not write everything");
@@ -152,23 +171,40 @@ fn handler(stream: &mut TcpStream) {
             }
         }
     }
-    if let Ok(peer) = stream.peer_addr() {
+    if let Ok(peer) = stream.get_ref().peer_addr() {
         info!("closed connection from {}", peer);
     } else {
         info!("closed connection");
     }
 }
 
-fn listener(addr: String) {
+fn listener(addr: String, ssl_context: &ssl::SslContext) {
     match TcpListener::bind(addr.as_str()) {
         Ok(listener) => {
             info!("listening on {}", listener.local_addr().unwrap());
             for stream in listener.incoming() {
                 match stream {
                     Ok(mut stream) => {
-                        thread::spawn(move || {
-                            handler(&mut stream);
-                        });
+                        match ssl::Ssl::new(ssl_context) {
+                            Ok(ssl) => {
+                                thread::spawn(move || {
+                                    match ssl::SslStream::connect(ssl, stream) {
+                                        Ok(mut ssl_stream) => {
+                                            handler(&mut ssl_stream);
+                                        },
+                                        Err(e) => {
+                                            error!("error when accepting connection: {}",
+                                                   e)
+                                        }
+                                    }
+                                });
+                                ()
+                            },
+                            Err(e) => {
+                                error!("error when accepting connection to {}: {}",
+                                       addr, e)
+                            }
+                        }
                     },
                     Err(e) =>
                         error!("error when accepting connection to {}: {}",
@@ -182,10 +218,11 @@ fn listener(addr: String) {
     }
 }
 
-pub fn start_listeners(config: &Config) {
+pub fn start_listeners(config: &Config, ssl_context: &ssl::SslContext) {
     for addr in config.listen_addresses.clone() {
         let a = addr.clone();
-        thread::spawn(move || listener(a));
+        let ssl_ctx = ssl_context.clone();
+        thread::spawn(move || listener(a, &ssl_ctx));
     }
 }
 
