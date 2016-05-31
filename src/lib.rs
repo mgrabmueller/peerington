@@ -2,6 +2,8 @@
 // top-level directory of this distribution for license information.
 //
 
+#[macro_use]
+extern crate log;
 extern crate uuid;
 extern crate getopts;
 extern crate openssl;
@@ -123,9 +125,9 @@ pub fn parse_opts(args: Vec<String>) -> Result<Config, error::ConfigError> {
 
 fn handler(stream: &mut TcpStream) {
     if let Ok(peer) = stream.peer_addr() {
-        println!("connection from {}", peer);
+        info!("connection from {}", peer);
     } else {
-        println!("connection attempt");
+        info!("connection attempt");
     }
     let mut buf = [33; 1024];
     loop {
@@ -136,26 +138,31 @@ fn handler(stream: &mut TcpStream) {
                 match stream.write(&buf[0..n]) {
                     Ok(x) =>
                         if x != n {
-                            println!("could not write everything");
+                            error!("could not write everything");
                             break;
                         },
                     Err(e) => {
-                        println!("error when writing: {}", e);
+                        error!("error when writing: {}", e);
                     }
                 }
             },
             Err(e) => {
-                println!("error when reading: {}", e);
+                error!("error when reading: {}", e);
                 break;
             }
         }
+    }
+    if let Ok(peer) = stream.peer_addr() {
+        info!("closed connection from {}", peer);
+    } else {
+        info!("closed connection");
     }
 }
 
 fn listener(addr: String) {
     match TcpListener::bind(addr.as_str()) {
         Ok(listener) => {
-            println!("listening on {}", listener.local_addr().unwrap());
+            info!("listening on {}", listener.local_addr().unwrap());
             for stream in listener.incoming() {
                 match stream {
                     Ok(mut stream) => {
@@ -164,13 +171,13 @@ fn listener(addr: String) {
                         });
                     },
                     Err(e) =>
-                        println!("error when accepting connection to {}: {}",
+                        error!("error when accepting connection to {}: {}",
                                  addr, e)
                 }
             }
         },
         Err(e) => {
-            println!("error when binding to {}: {}", addr, e);
+            error!("error when binding to {}: {}", addr, e);
         }
     }
 }

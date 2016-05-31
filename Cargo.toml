@@ -7,3 +7,4 @@ authors = ["Martin Grabmueller <martin@grabmueller.de>"]
 uuid = { version = "0.2", features = ["v4"] }
 getopts = "0.2"
 openssl = "*"
+log = "*"
