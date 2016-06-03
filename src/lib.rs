@@ -11,6 +11,7 @@ extern crate openssl;
 use uuid::Uuid;
 use getopts::Options;
 use openssl::ssl;
+use openssl::nid;
 use openssl::x509;
 use openssl::x509::X509ValidationError::*;
 
@@ -216,12 +217,36 @@ pub fn parse_opts(args: Vec<String>) -> Result<Config, error::ConfigError> {
     };
 }
 
+/// Handle an established TLS connection.  The UUID of the peer is
+/// taken from the peer certificate.
 fn handler(stream: &mut ssl::SslStream<TcpStream>) {
     if let Ok(peer) = stream.get_ref().peer_addr() {
-        info!("connection from {}", peer);
+        info!("connected to {}", peer);
     } else {
-        info!("connection attempt");
+        error!("cannot determine peer address, closing connection.");
+        return;
     }
+    if let Some(peer_cert) = stream.ssl().peer_certificate() {
+        let name = peer_cert.subject_name();
+        if let Some(peer_name) = name.text_by_nid(nid::Nid::CN) {
+            match Uuid::parse_str(&peer_name) {
+                Ok(u) => {
+                    info!("UUID of peer: {}", u);
+                }
+                Err(e) => {
+                    error!("peer's CN is not a valid UUID: {}, closing connection.", e);
+                    return;
+                }
+            }
+        } else {
+            error!("no name CN in peer certificate, closing connection.");
+            return;
+        }
+    } else {
+        error!("cannot get peer certificate, closing connection.");
+        return;
+    }
+    stream.ssl_write(b"Welcome to the TLS echo server!\n").unwrap();
     let mut buf = [33; 1024];
     loop {
         match stream.ssl_read(&mut buf) {
@@ -236,6 +261,7 @@ fn handler(stream: &mut ssl::SslStream<TcpStream>) {
                         },
                     Err(e) => {
                         error!("error when writing: {}", e);
+                        break;
                     }
                 }
             },
@@ -252,6 +278,9 @@ fn handler(stream: &mut ssl::SslStream<TcpStream>) {
     }
 }
 
+/// Bind to the given address and wait for incoming connections, using
+/// the context to establish TLS connections.  Call the handler
+/// function for each connection.
 fn listener(addr: String, ssl_context: &ssl::SslContext) {
     match TcpListener::bind(addr.as_str()) {
         Ok(listener) => {
@@ -292,11 +321,51 @@ fn listener(addr: String, ssl_context: &ssl::SslContext) {
     }
 }
 
+/// Connect to the given address, using the context to establish a TLS
+/// connection.  Call the handler function when connected.
+fn connector(addr: String, ssl_context: &ssl::SslContext) {
+    match TcpStream::connect(addr.as_str()) {
+        Ok(stream) => {
+            match ssl::Ssl::new(ssl_context) {
+                Ok(ssl) => {
+                    thread::spawn(move || {
+                        match ssl::SslStream::connect(ssl, stream) {
+                            Ok(mut ssl_stream) => {
+                                handler(&mut ssl_stream);
+                            },
+                            Err(e) => {
+                                error!("error when accepting connection: {}",
+                                       e)
+                            }
+                        }
+                    });
+                    ()
+                },
+                Err(e) => {
+                    error!("error when establishing TLS connection to {}: {}",
+                           addr, e)
+                }
+            }
+        },
+        Err(e) =>
+            error!("error when connecting to {}: {}",
+                   addr, e)
+    }
+}
+
 pub fn start_listeners(config: &Config, ssl_context: &ssl::SslContext) {
     for addr in config.listen_addresses.clone() {
         let a = addr.clone();
         let ssl_ctx = ssl_context.clone();
         thread::spawn(move || listener(a, &ssl_ctx));
+    }
+}
+
+pub fn connect_seeds(config: &Config, ssl_context: &ssl::SslContext) {
+    for addr in config.seed_addresses.clone() {
+        let a = addr.clone();
+        let ssl_ctx = ssl_context.clone();
+        thread::spawn(move || connector(a, &ssl_ctx));
     }
 }
 
