@@ -12,8 +12,8 @@ use uuid::Uuid;
 use getopts::Options;
 use openssl::ssl;
 use openssl::x509;
+use openssl::x509::X509ValidationError::*;
 
-use std::io::Write;
 use std::io::Read;
 use std::net::TcpListener;
 use std::net::TcpStream;
@@ -29,6 +29,78 @@ pub fn print_usage(program: &str, opts: Options) {
 
 pub struct NodeState {
     pub ssl_context: ssl::SslContext
+}
+
+fn verify_client_cert(preverify_ok: bool, x509_ctx: &x509::X509StoreContext) -> bool {
+    if preverify_ok {
+         return true;
+    } else {
+        let err =
+            match x509_ctx.get_error() {
+                Some(e) =>
+                    match e {
+                        X509UnableToGetIssuerCert => "X509UnableToGetIssuerCert",
+                        X509UnableToGetCrl => "X509UnableToGetCrl",
+                        X509UnableToDecryptCertSignature => "X509UnableToDecryptCertSignature",
+                        X509UnableToDecryptCrlSignature => "X509UnableToDecryptCrlSignature",
+                        X509UnableToDecodeIssuerPublicKey => "X509UnableToDecodeIssuerPublicKey",
+                        X509CertSignatureFailure => "X509CertSignatureFailure",
+                        X509CrlSignatureFailure => "X509CrlSignatureFailure",
+                        X509CertNotYetValid => "X509CertNotYetValid",
+                        X509CertHasExpired => "X509CertHasExpired",
+                        X509CrlNotYetValid => "X509CrlNotYetValid",
+                        X509CrlHasExpired => "X509CrlHasExpired",
+                        X509ErrorInCertNotBeforeField => "X509ErrorInCertNotBeforeField",
+                        X509ErrorInCertNotAfterField => "X509ErrorInCertNotAfterField",
+                        X509ErrorInCrlLastUpdateField => "X509ErrorInCrlLastUpdateField",
+                        X509ErrorInCrlNextUpdateField => "X509ErrorInCrlNextUpdateField",
+                        X509OutOfMem => "X509OutOfMem",
+                        X509DepthZeroSelfSignedCert => "X509DepthZeroSelfSignedCert",
+                        X509SelfSignedCertInChain => "X509SelfSignedCertInChain",
+                        X509UnableToGetIssuerCertLocally => "X509UnableToGetIssuerCertLocally",
+                        X509UnableToVerifyLeafSignature => "X509UnableToVerifyLeafSignature",
+                        X509CertChainTooLong => "X509CertChainTooLong",
+                        X509CertRevoked => "X509CertRevoked",
+                        X509InvalidCA => "X509InvalidCA",
+                        X509PathLengthExceeded => "X509PathLengthExceeded",
+                        X509InvalidPurpose => "X509InvalidPurpose",
+                        X509CertUntrusted => "X509CertUntrusted",
+                        X509CertRejected => "X509CertRejected",
+                        X509SubjectIssuerMismatch => "X509SubjectIssuerMismatch",
+                        X509AkidSkidMismatch => "X509AkidSkidMismatch",
+                        X509AkidIssuerSerialMismatch => "X509AkidIssuerSerialMismatch",
+                        X509KeyusageNoCertsign => "X509KeyusageNoCertsign",
+                        X509UnableToGetCrlIssuer => "X509UnableToGetCrlIssuer",
+                        X509UnhandledCriticalExtension => "X509UnhandledCriticalExtension",
+                        X509KeyusageNoCrlSign => "X509KeyusageNoCrlSign",
+                        X509UnhandledCriticalCrlExtension => "X509UnhandledCriticalCrlExtension",
+                        X509InvalidNonCA => "X509InvalidNonCA",
+                        X509ProxyPathLengthExceeded => "X509ProxyPathLengthExceeded",
+                        X509KeyusageNoDigitalSignature => "X509KeyusageNoDigitalSignature",
+                        X509ProxyCertificatesNotAllowed => "X509ProxyCertificatesNotAllowed",
+                        X509InvalidExtension => "X509InvalidExtension",
+                        X509InavlidPolicyExtension => "X509InavlidPolicyExtension",
+                        X509NoExplicitPolicy => "X509NoExplicitPolicy",
+                        X509DifferentCrlScope => "X509DifferentCrlScope",
+                        X509UnsupportedExtensionFeature => "X509UnsupportedExtensionFeature",
+                        X509UnnestedResource => "X509UnnestedResource",
+                        X509PermittedVolation => "X509PermittedVolation",
+                        X509ExcludedViolation => "X509ExcludedViolation",
+                        X509SubtreeMinmax => "X509SubtreeMinmax",
+                        X509UnsupportedConstraintType => "X509UnsupportedConstraintType",
+                        X509UnsupportedConstraintSyntax => "X509UnsupportedConstraintSyntax",
+                        X509UnsupportedNameSyntax => "X509UnsupportedNameSyntax",
+                        X509CrlPathValidationError => "X509CrlPathValidationError",
+                        X509ApplicationVerification => "X509ApplicationVerification",
+                        X509UnknownError(_i) => "X509UnknownError"
+                    },
+                None => "no error"
+            };
+        
+        error!("client certificate check failed at depth {}: {}", x509_ctx.error_depth(), err);
+
+        return false;
+    }
 }
 
 impl NodeState {
@@ -58,6 +130,8 @@ impl NodeState {
         try!(ssl_context.set_private_key_file(&priv_key_path,
                                               x509::X509FileType::PEM));
         try!(ssl_context.check_private_key());
+
+        ssl_context.set_verify(ssl::SSL_VERIFY_PEER | ssl::SSL_VERIFY_FAIL_IF_NO_PEER_CERT, Some(verify_client_cert));
         
         Ok(NodeState {
             ssl_context: ssl_context
@@ -184,11 +258,11 @@ fn listener(addr: String, ssl_context: &ssl::SslContext) {
             info!("listening on {}", listener.local_addr().unwrap());
             for stream in listener.incoming() {
                 match stream {
-                    Ok(mut stream) => {
+                    Ok(stream) => {
                         match ssl::Ssl::new(ssl_context) {
                             Ok(ssl) => {
                                 thread::spawn(move || {
-                                    match ssl::SslStream::connect(ssl, stream) {
+                                    match ssl::SslStream::accept(ssl, stream) {
                                         Ok(mut ssl_stream) => {
                                             handler(&mut ssl_stream);
                                         },
