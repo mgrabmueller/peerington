@@ -15,7 +15,12 @@ use openssl::nid;
 use openssl::x509;
 use openssl::x509::X509ValidationError::*;
 
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::collections::BTreeMap;
+use std::io;
 use std::io::Read;
+use std::io::Write;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::thread;
@@ -29,7 +34,8 @@ pub fn print_usage(program: &str, opts: Options) {
 }
 
 pub struct NodeState {
-    pub ssl_context: ssl::SslContext
+    pub ssl_context: ssl::SslContext,
+    pub node_map: Arc<Mutex<BTreeMap<String, Uuid>>>
 }
 
 fn verify_client_cert(preverify_ok: bool, x509_ctx: &x509::X509StoreContext) -> bool {
@@ -132,10 +138,14 @@ impl NodeState {
                                               x509::X509FileType::PEM));
         try!(ssl_context.check_private_key());
 
-        ssl_context.set_verify(ssl::SSL_VERIFY_PEER | ssl::SSL_VERIFY_FAIL_IF_NO_PEER_CERT, Some(verify_client_cert));
-        
+        ssl_context.set_verify(ssl::SSL_VERIFY_PEER
+                               | ssl::SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                               Some(verify_client_cert));
+
+        let node_map = BTreeMap::new();
         Ok(NodeState {
-            ssl_context: ssl_context
+            ssl_context: ssl_context,
+            node_map: Arc::new(Mutex::new(node_map))
         })
     }
 }
@@ -217,42 +227,14 @@ pub fn parse_opts(args: Vec<String>) -> Result<Config, error::ConfigError> {
     };
 }
 
-/// Handle an established TLS connection.  The UUID of the peer is
-/// taken from the peer certificate.
-fn handler(stream: &mut ssl::SslStream<TcpStream>) {
-    if let Ok(peer) = stream.get_ref().peer_addr() {
-        info!("connected to {}", peer);
-    } else {
-        error!("cannot determine peer address, closing connection.");
-        return;
-    }
-    if let Some(peer_cert) = stream.ssl().peer_certificate() {
-        let name = peer_cert.subject_name();
-        if let Some(peer_name) = name.text_by_nid(nid::Nid::CN) {
-            match Uuid::parse_str(&peer_name) {
-                Ok(u) => {
-                    info!("UUID of peer: {}", u);
-                }
-                Err(e) => {
-                    error!("peer's CN is not a valid UUID: {}, closing connection.", e);
-                    return;
-                }
-            }
-        } else {
-            error!("no name CN in peer certificate, closing connection.");
-            return;
-        }
-    } else {
-        error!("cannot get peer certificate, closing connection.");
-        return;
-    }
-    stream.ssl_write(b"Welcome to the TLS echo server!\n").unwrap();
+fn handler_loop(node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>) {
     let mut buf = [33; 1024];
     loop {
         match stream.ssl_read(&mut buf) {
             Ok(0) =>
                 break,
             Ok(n) => {
+                io::stdout().write(&buf[0..n]).unwrap();
                 match stream.ssl_write(&buf[0..n]) {
                     Ok(x) =>
                         if x != n {
@@ -271,43 +253,105 @@ fn handler(stream: &mut ssl::SslStream<TcpStream>) {
             }
         }
     }
-    if let Ok(peer) = stream.get_ref().peer_addr() {
-        info!("closed connection from {}", peer);
+}
+
+fn get_peer_uuid(stream: &ssl::SslStream<TcpStream>) -> Option<Uuid> {
+    if let Some(peer_cert) = stream.ssl().peer_certificate() {
+        let name = peer_cert.subject_name();
+        if let Some(peer_name) = name.text_by_nid(nid::Nid::CN) {
+            match Uuid::parse_str(&peer_name) {
+                Ok(u) => {
+                    Some(u)
+                },
+                Err(e) => {
+                    error!("peer's CN is not a valid UUID: {}.", e);
+                    None
+                }
+            }
+        } else {
+            error!("no name CN in peer certificate.");
+            None
+        }
     } else {
-        info!("closed connection");
+        error!("cannot get peer certificate, closing connection.");
+        None
+    }
+}
+
+/// Handle an established TLS connection.  The UUID of the peer is
+/// taken from the peer certificate.
+fn handler(node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>) {
+    if let Ok(peer) = stream.get_ref().peer_addr() {
+        info!("connected to {}", peer);
+        match get_peer_uuid(stream) {
+            Some(u) => {
+                info!("UUID of peer: {}", u);
+                let inserted =
+                    match node_state.node_map.lock() {
+                        Ok(mut node_map) => {
+                            node_map.insert(u.to_string(), u);
+                            true
+                        }
+                        Err(_) => {
+                            error!("cannot lock node map");
+                            false
+                        }
+                    };
+                if inserted {
+                    handler_loop(node_state.clone(), stream);
+                    match node_state.node_map.lock() {
+                        Ok(mut node_map) => {
+                            node_map.remove(&u.to_string());
+                            ()
+                        }
+                        Err(_) => {
+                            error!("cannot lock node map");
+                        }
+                    }
+                }
+            }
+            None => {
+                ()
+            }
+        }
+        info!("{} disconnected", peer);
+    } else {
+        error!("cannot determine peer address, closing connection.");
     }
 }
 
 /// Bind to the given address and wait for incoming connections, using
 /// the context to establish TLS connections.  Call the handler
 /// function for each connection.
-fn listener(addr: String, ssl_context: &ssl::SslContext) {
+fn listener(node_state: Arc<NodeState>, addr: String) {
     match TcpListener::bind(addr.as_str()) {
         Ok(listener) => {
             info!("listening on {}", listener.local_addr().unwrap());
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
-                        match ssl::Ssl::new(ssl_context) {
-                            Ok(ssl) => {
-                                thread::spawn(move || {
+                        let ns = node_state.clone();
+                        let a = addr.clone();
+                        thread::spawn(move || {
+                            match ssl::Ssl::new(&ns.ssl_context) {
+                                Ok(ssl) => {
                                     match ssl::SslStream::accept(ssl, stream) {
                                         Ok(mut ssl_stream) => {
-                                            handler(&mut ssl_stream);
+                                            handler(ns, &mut ssl_stream);
                                         },
                                         Err(e) => {
                                             error!("error when accepting connection: {}",
                                                    e)
                                         }
                                     }
-                                });
-                                ()
-                            },
-                            Err(e) => {
-                                error!("error when accepting connection to {}: {}",
-                                       addr, e)
+                                }
+                                Err(e) => {
+                                    error!("error when accepting connection to {}: {}",
+                                           a, e)
+                                }
                             }
-                        }
+                        });
+                        ()
                     },
                     Err(e) =>
                         error!("error when accepting connection to {}: {}",
@@ -323,15 +367,15 @@ fn listener(addr: String, ssl_context: &ssl::SslContext) {
 
 /// Connect to the given address, using the context to establish a TLS
 /// connection.  Call the handler function when connected.
-fn connector(addr: String, ssl_context: &ssl::SslContext) {
+fn connector(node_state: Arc<NodeState>, addr: String) {
     match TcpStream::connect(addr.as_str()) {
         Ok(stream) => {
-            match ssl::Ssl::new(ssl_context) {
+            match ssl::Ssl::new(&node_state.ssl_context) {
                 Ok(ssl) => {
                     thread::spawn(move || {
                         match ssl::SslStream::connect(ssl, stream) {
                             Ok(mut ssl_stream) => {
-                                handler(&mut ssl_stream);
+                                handler(node_state, &mut ssl_stream);
                             },
                             Err(e) => {
                                 error!("error when accepting connection: {}",
@@ -353,19 +397,19 @@ fn connector(addr: String, ssl_context: &ssl::SslContext) {
     }
 }
 
-pub fn start_listeners(config: &Config, ssl_context: &ssl::SslContext) {
+pub fn start_listeners(config: &Config, node_state: Arc<NodeState>) {
     for addr in config.listen_addresses.clone() {
         let a = addr.clone();
-        let ssl_ctx = ssl_context.clone();
-        thread::spawn(move || listener(a, &ssl_ctx));
+        let ns = node_state.clone();
+        thread::spawn(move || listener(ns, a));
     }
 }
 
-pub fn connect_seeds(config: &Config, ssl_context: &ssl::SslContext) {
+pub fn connect_seeds(config: &Config, node_state: Arc<NodeState>) {
     for addr in config.seed_addresses.clone() {
         let a = addr.clone();
-        let ssl_ctx = ssl_context.clone();
-        thread::spawn(move || connector(a, &ssl_ctx));
+        let ns = node_state.clone();
+        thread::spawn(move || connector(ns, a));
     }
 }
 
