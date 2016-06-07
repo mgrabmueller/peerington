@@ -420,7 +420,7 @@ mod test {
     #[test]
     fn no_listen() {
         let ok = match parse_opts(vec!["prog".to_string()]) {
-            Err(ConfigError::NoListenAddress) => true,
+            Err(error::ConfigError::NoListenAddress) => true,
             _ => false
         };
         assert!(ok);
@@ -430,7 +430,7 @@ mod test {
     fn no_workspace() {
         let ok = match parse_opts(vec!["prog".to_string(),
                                        "--listen=localhost:1234".to_string()]) {
-            Err(ConfigError::NoWorkspace) => true,
+            Err(error::ConfigError::NoWorkspace) => true,
             _ => false
         };
         assert!(ok);
@@ -441,7 +441,7 @@ mod test {
         let ok = match parse_opts(vec!["prog".to_string(),
                                        "--listen=localhost:1234".to_string(),
                                        "--workspace=space".to_string()]) {
-            Err(ConfigError::NoUuid) => true,
+            Err(error::ConfigError::NoUuid) => true,
             _ => false
         };
         assert!(ok);
@@ -453,7 +453,7 @@ mod test {
                                        "--listen=localhost:1234".to_string(),
                                        "--workspace=space".to_string(),
                                        "--uuid=abcde".to_string()]) {
-            Err(ConfigError::InvalidUuid(_)) => true,
+            Err(error::ConfigError::InvalidUuid(_)) => true,
             _ => false
         };
         assert!(ok);
@@ -462,7 +462,7 @@ mod test {
     #[test]
     fn invalid_arg() {
         let ok = match parse_opts(vec!["prog".to_string(), "--hepl".to_string()]) {
-            Err(ConfigError::GetOptError(_)) => true,
+            Err(error::ConfigError::GetOptError(_)) => true,
             _ => false
         };
         assert!(ok);
@@ -471,7 +471,7 @@ mod test {
     #[test]
     fn help_arg() {
         let ok = match parse_opts(vec!["prog".to_string(), "-h".to_string()]) {
-            Err(ConfigError::HelpRequested(_)) => true,
+            Err(error::ConfigError::HelpRequested(_)) => true,
             _ => false
         };
         assert!(ok);
@@ -480,7 +480,7 @@ mod test {
     #[test]
     fn long_help_arg() {
         let ok = match parse_opts(vec!["prog".to_string(), "--help".to_string()]) {
-            Err(ConfigError::HelpRequested(_)) => true,
+            Err(error::ConfigError::HelpRequested(_)) => true,
             _ => false
         };
         assert!(ok);
