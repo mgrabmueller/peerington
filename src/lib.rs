@@ -227,7 +227,7 @@ pub fn parse_opts(args: Vec<String>) -> Result<Config, error::ConfigError> {
     };
 }
 
-fn handler_loop(node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>) {
+fn handler_loop(_node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>) {
     let mut buf = [33; 1024];
     loop {
         match stream.ssl_read(&mut buf) {
