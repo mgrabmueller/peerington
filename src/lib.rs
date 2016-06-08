@@ -33,9 +33,13 @@ pub fn print_usage(program: &str, opts: Options) {
     print!("{}", opts.usage(&brief));
 }
 
+pub struct NodeInfo {
+    pub uuid: Uuid,
+}
+
 pub struct NodeState {
     pub ssl_context: ssl::SslContext,
-    pub node_map: Arc<Mutex<BTreeMap<String, Uuid>>>
+    pub connected_nodes: Arc<Mutex<BTreeMap<String, NodeInfo>>>
 }
 
 fn verify_client_cert(preverify_ok: bool, x509_ctx: &x509::X509StoreContext) -> bool {
@@ -145,7 +149,7 @@ impl NodeState {
         let node_map = BTreeMap::new();
         Ok(NodeState {
             ssl_context: ssl_context,
-            node_map: Arc::new(Mutex::new(node_map))
+            connected_nodes: Arc::new(Mutex::new(node_map))
         })
     }
 }
@@ -287,9 +291,12 @@ fn handler(node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>) {
             Some(u) => {
                 info!("UUID of peer: {}", u);
                 let inserted =
-                    match node_state.node_map.lock() {
-                        Ok(mut node_map) => {
-                            node_map.insert(u.to_string(), u);
+                    match node_state.connected_nodes.lock() {
+                        Ok(mut connected_nodes) => {
+                            connected_nodes.insert(u.to_string(),
+                                                   NodeInfo{
+                                                       uuid: u
+                                                   });
                             true
                         }
                         Err(_) => {
@@ -299,9 +306,9 @@ fn handler(node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>) {
                     };
                 if inserted {
                     handler_loop(node_state.clone(), stream);
-                    match node_state.node_map.lock() {
-                        Ok(mut node_map) => {
-                            node_map.remove(&u.to_string());
+                    match node_state.connected_nodes.lock() {
+                        Ok(mut connected_nodes) => {
+                            connected_nodes.remove(&u.to_string());
                             ()
                         }
                         Err(_) => {

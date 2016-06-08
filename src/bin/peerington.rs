@@ -155,10 +155,10 @@ fn repl(_config: &Config, node_state: Arc<NodeState>) {
 fn execute(cmd: Command, node_state: Arc<NodeState>) {
     match cmd {
         Command::Nodes => {
-            match node_state.node_map.lock() {
-                Ok(node_map) => {
-                    for (name, uuid) in &*node_map {
-                        println!("{} : {}", name, uuid.to_string());
+            match node_state.connected_nodes.lock() {
+                Ok(connected_nodes) => {
+                    for (name, node_info) in &*connected_nodes {
+                        println!("{} : {}", name, node_info.uuid.to_string());
                     }
                     ()
                 }
