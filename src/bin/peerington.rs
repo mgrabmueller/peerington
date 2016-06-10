@@ -6,14 +6,17 @@ use peerington::print_usage;
 use peerington::error::ConfigError;
 use peerington::Config;
 use peerington::NodeState;
+use peerington::Message;
 use peerington::start_listeners;
 use peerington::connect_seeds;
 
+use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::env;
 use std::io;
 use std::io::Write;
 use std::fmt;
+use std::thread;
 
 fn main() {
     env_logger::init().unwrap();
@@ -48,7 +51,18 @@ fn main() {
             match NodeState::new(&config) {
                 Ok(node_state) => {
                     let ns = Arc::new(node_state);
-                    start_listeners(&config, ns.clone());
+                    let (sender, receiver) = sync_channel(100);
+                    thread::spawn(move || {
+                        loop {
+                            let d = receiver.recv().unwrap();
+                            match d {
+                                Message::Data(u, v) => {
+                                    println!("received data from {}: {:?}", u, v);
+                                }
+                            }
+                        }
+                    });
+                    start_listeners(&config, ns.clone(), sender);
                     connect_seeds(&config, ns.clone());
                     repl(&config, ns);
                     ()

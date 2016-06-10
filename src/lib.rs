@@ -15,6 +15,7 @@ use openssl::nid;
 use openssl::x509;
 use openssl::x509::X509ValidationError::*;
 
+use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::collections::BTreeMap;
@@ -231,7 +232,32 @@ pub fn parse_opts(args: Vec<String>) -> Result<Config, error::ConfigError> {
     };
 }
 
-fn handler_loop(_node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>) {
+pub enum Message {
+    Data(Uuid, Vec<u8>)
+}
+
+fn recv_handler_loop(_node_state: Arc<NodeState>, uuid: Uuid,
+                     stream: &mut ssl::SslStream<TcpStream>, sender: SyncSender<Message>) {
+    let mut buf = [33; 1024];
+    loop {
+        match stream.ssl_read(&mut buf) {
+            Ok(0) =>
+                break,
+            Ok(n) => {
+                //                io::stdout().write(&buf[0..n]).unwrap();
+                let mut v = Vec::new();
+                v.extend(&buf[0..n]);
+                sender.send(Message::Data(uuid, v)).unwrap();
+            },
+            Err(e) => {
+                error!("error when reading: {}", e);
+                break;
+            }
+        }
+    }
+}
+
+fn send_handler_loop(_node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>) {
     let mut buf = [33; 1024];
     loop {
         match stream.ssl_read(&mut buf) {
@@ -284,7 +310,8 @@ fn get_peer_uuid(stream: &ssl::SslStream<TcpStream>) -> Option<Uuid> {
 
 /// Handle an established TLS connection.  The UUID of the peer is
 /// taken from the peer certificate.
-fn handler(node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>) {
+fn recv_handler(node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>,
+                sender: SyncSender<Message>) {
     if let Ok(peer) = stream.get_ref().peer_addr() {
         info!("connected to {}", peer);
         match get_peer_uuid(stream) {
@@ -305,7 +332,52 @@ fn handler(node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>) {
                         }
                     };
                 if inserted {
-                    handler_loop(node_state.clone(), stream);
+                    recv_handler_loop(node_state.clone(), u, stream, sender);
+                    match node_state.connected_nodes.lock() {
+                        Ok(mut connected_nodes) => {
+                            connected_nodes.remove(&u.to_string());
+                            ()
+                        }
+                        Err(_) => {
+                            error!("cannot lock node map");
+                        }
+                    }
+                }
+            }
+            None => {
+                ()
+            }
+        }
+        info!("{} disconnected", peer);
+    } else {
+        error!("cannot determine peer address, closing connection.");
+    }
+}
+
+/// Handle an established TLS connection.  The UUID of the peer is
+/// taken from the peer certificate.
+fn send_handler(node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>) {
+    if let Ok(peer) = stream.get_ref().peer_addr() {
+        info!("connected to {}", peer);
+        match get_peer_uuid(stream) {
+            Some(u) => {
+                info!("UUID of peer: {}", u);
+                let inserted =
+                    match node_state.connected_nodes.lock() {
+                        Ok(mut connected_nodes) => {
+                            connected_nodes.insert(u.to_string(),
+                                                   NodeInfo{
+                                                       uuid: u
+                                                   });
+                            true
+                        }
+                        Err(_) => {
+                            error!("cannot lock node map");
+                            false
+                        }
+                    };
+                if inserted {
+                    send_handler_loop(node_state.clone(), stream);
                     match node_state.connected_nodes.lock() {
                         Ok(mut connected_nodes) => {
                             connected_nodes.remove(&u.to_string());
@@ -330,7 +402,7 @@ fn handler(node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>) {
 /// Bind to the given address and wait for incoming connections, using
 /// the context to establish TLS connections.  Call the handler
 /// function for each connection.
-fn listener(node_state: Arc<NodeState>, addr: String) {
+fn listener(node_state: Arc<NodeState>, addr: String, sender: SyncSender<Message>) {
     match TcpListener::bind(addr.as_str()) {
         Ok(listener) => {
             info!("listening on {}", listener.local_addr().unwrap());
@@ -339,12 +411,13 @@ fn listener(node_state: Arc<NodeState>, addr: String) {
                     Ok(stream) => {
                         let ns = node_state.clone();
                         let a = addr.clone();
+                        let send = sender.clone();
                         thread::spawn(move || {
                             match ssl::Ssl::new(&ns.ssl_context) {
                                 Ok(ssl) => {
                                     match ssl::SslStream::accept(ssl, stream) {
                                         Ok(mut ssl_stream) => {
-                                            handler(ns, &mut ssl_stream);
+                                            recv_handler(ns, &mut ssl_stream, send);
                                         },
                                         Err(e) => {
                                             error!("error when accepting connection: {}",
@@ -382,7 +455,7 @@ fn connector(node_state: Arc<NodeState>, addr: String) {
                     thread::spawn(move || {
                         match ssl::SslStream::connect(ssl, stream) {
                             Ok(mut ssl_stream) => {
-                                handler(node_state, &mut ssl_stream);
+                                send_handler(node_state, &mut ssl_stream);
                             },
                             Err(e) => {
                                 error!("error when accepting connection: {}",
@@ -404,11 +477,12 @@ fn connector(node_state: Arc<NodeState>, addr: String) {
     }
 }
 
-pub fn start_listeners(config: &Config, node_state: Arc<NodeState>) {
+pub fn start_listeners(config: &Config, node_state: Arc<NodeState>, sender: SyncSender<Message>) {
     for addr in config.listen_addresses.clone() {
         let a = addr.clone();
         let ns = node_state.clone();
-        thread::spawn(move || listener(ns, a));
+        let s = sender.clone();
+        thread::spawn(move || listener(ns, a, s));
     }
 }
 
