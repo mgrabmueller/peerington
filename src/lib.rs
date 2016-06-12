@@ -16,14 +16,17 @@ use openssl::x509;
 use openssl::x509::X509ValidationError::*;
 
 use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::collections::BTreeMap;
-use std::io;
+//use std::io;
 use std::io::Read;
-use std::io::Write;
+//use std::io::Write;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::net::SocketAddr;
 use std::thread;
 
 pub mod error;
@@ -36,12 +39,51 @@ pub fn print_usage(program: &str, opts: Options) {
 
 pub struct NodeInfo {
     pub uuid: Uuid,
+    pub address: SocketAddr,
+}
+
+pub struct NodeInfoRecv {
+    pub node_info: NodeInfo,
+}
+
+pub struct NodeInfoSend {
+    pub node_info: NodeInfo,
+    tx: SyncSender<Message>
 }
 
 pub struct NodeState {
     pub ssl_context: ssl::SslContext,
-    pub connected_nodes: Arc<Mutex<BTreeMap<String, NodeInfo>>>
+    pub address_map: Arc<Mutex<BTreeMap<Uuid, SocketAddr>>>,
+    pub connected_nodes_recv: Arc<Mutex<BTreeMap<Uuid, NodeInfoRecv>>>,
+    pub connected_nodes_send: Arc<Mutex<BTreeMap<Uuid, NodeInfoSend>>>,
 }
+
+pub fn send_message(node_state: Arc<NodeState>,
+                    to: &Uuid,
+                    message: Message) {
+    let tx =
+        match node_state.connected_nodes_send.lock() {
+            Ok(connected_nodes) => {
+                if let Some(ni) = connected_nodes.get(&to) {
+                    Some(ni.tx.clone())
+                } else {
+                    None
+                }
+            }
+            Err(_) => {
+                error!("cannot lock node map");
+                None
+            }
+        };
+    match tx {
+        Some(tx) =>
+            tx.send(message).expect(
+                &format!("could not send internal message to {}", to)),
+        None =>
+            error!("send to unconnected node")
+    }
+}
+    
 
 fn verify_client_cert(preverify_ok: bool, x509_ctx: &x509::X509StoreContext) -> bool {
     if preverify_ok {
@@ -147,10 +189,14 @@ impl NodeState {
                                | ssl::SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
                                Some(verify_client_cert));
 
-        let node_map = BTreeMap::new();
+        let addr_map = BTreeMap::new();
+        let node_map_recv = BTreeMap::new();
+        let node_map_send = BTreeMap::new();
         Ok(NodeState {
             ssl_context: ssl_context,
-            connected_nodes: Arc::new(Mutex::new(node_map))
+            address_map: Arc::new(Mutex::new(addr_map)),
+            connected_nodes_recv: Arc::new(Mutex::new(node_map_recv)),
+            connected_nodes_send: Arc::new(Mutex::new(node_map_send)),
         })
     }
 }
@@ -257,15 +303,12 @@ fn recv_handler_loop(_node_state: Arc<NodeState>, uuid: Uuid,
     }
 }
 
-fn send_handler_loop(_node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>) {
-    let mut buf = [33; 1024];
+fn send_handler_loop(_node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStream>, rx: Receiver<Message>) {
     loop {
-        match stream.ssl_read(&mut buf) {
-            Ok(0) =>
-                break,
-            Ok(n) => {
-                io::stdout().write(&buf[0..n]).unwrap();
-                match stream.ssl_write(&buf[0..n]) {
+        match rx.recv() {
+            Ok(Message::Data(_uuid, v)) => {
+                let n = v.len();
+                match stream.ssl_write(&v) {
                     Ok(x) =>
                         if x != n {
                             error!("could not write everything");
@@ -278,7 +321,7 @@ fn send_handler_loop(_node_state: Arc<NodeState>, stream: &mut ssl::SslStream<Tc
                 }
             },
             Err(e) => {
-                error!("error when reading: {}", e);
+                error!("error receiving internal message: {}", e);
                 break;
             }
         }
@@ -318,11 +361,15 @@ fn recv_handler(node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStrea
             Some(u) => {
                 info!("UUID of peer: {}", u);
                 let inserted =
-                    match node_state.connected_nodes.lock() {
+                    match node_state.connected_nodes_recv.lock() {
                         Ok(mut connected_nodes) => {
-                            connected_nodes.insert(u.to_string(),
-                                                   NodeInfo{
-                                                       uuid: u
+                            connected_nodes.insert(u,
+                                                   NodeInfoRecv{
+                                                       node_info:
+                                                       NodeInfo{
+                                                           uuid: u,
+                                                           address: peer
+                                                       }
                                                    });
                             true
                         }
@@ -332,10 +379,18 @@ fn recv_handler(node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStrea
                         }
                     };
                 if inserted {
+                    match node_state.address_map.lock() {
+                        Ok(mut addr_map) => {
+                            addr_map.insert(u, peer);
+                        }
+                        Err(_) => {
+                            error!("cannot lock address map");
+                        }
+                    };
                     recv_handler_loop(node_state.clone(), u, stream, sender);
-                    match node_state.connected_nodes.lock() {
+                    match node_state.connected_nodes_recv.lock() {
                         Ok(mut connected_nodes) => {
-                            connected_nodes.remove(&u.to_string());
+                            connected_nodes.remove(&u);
                             ()
                         }
                         Err(_) => {
@@ -361,13 +416,19 @@ fn send_handler(node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStrea
         info!("connected to {}", peer);
         match get_peer_uuid(stream) {
             Some(u) => {
+                let (tx, rx) = sync_channel(100);
                 info!("UUID of peer: {}", u);
                 let inserted =
-                    match node_state.connected_nodes.lock() {
+                    match node_state.connected_nodes_send.lock() {
                         Ok(mut connected_nodes) => {
-                            connected_nodes.insert(u.to_string(),
-                                                   NodeInfo{
-                                                       uuid: u
+                            connected_nodes.insert(u,
+                                                   NodeInfoSend{
+                                                       node_info:
+                                                       NodeInfo{
+                                                           uuid: u,
+                                                           address: peer,
+                                                       },
+                                                       tx: tx,
                                                    });
                             true
                         }
@@ -377,10 +438,18 @@ fn send_handler(node_state: Arc<NodeState>, stream: &mut ssl::SslStream<TcpStrea
                         }
                     };
                 if inserted {
-                    send_handler_loop(node_state.clone(), stream);
-                    match node_state.connected_nodes.lock() {
+                    match node_state.address_map.lock() {
+                        Ok(mut addr_map) => {
+                            addr_map.insert(u, peer);
+                        }
+                        Err(_) => {
+                            error!("cannot lock address map");
+                        }
+                    };
+                    send_handler_loop(node_state.clone(), stream, rx);
+                    match node_state.connected_nodes_send.lock() {
                         Ok(mut connected_nodes) => {
-                            connected_nodes.remove(&u.to_string());
+                            connected_nodes.remove(&u);
                             ()
                         }
                         Err(_) => {

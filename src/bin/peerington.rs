@@ -9,6 +9,7 @@ use peerington::NodeState;
 use peerington::Message;
 use peerington::start_listeners;
 use peerington::connect_seeds;
+use peerington::send_message;
 
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
@@ -81,7 +82,9 @@ enum Command {
     /// Print statistics to the console.
     Stats,
     /// Print all known nodes.
-    Nodes
+    Nodes,
+    /// Broadcast a message.
+    Send,
 }
 
 impl fmt::Display for Command {
@@ -92,7 +95,9 @@ impl fmt::Display for Command {
             Command::Stats =>
                 write!(f, "stats"),
             Command::Nodes =>
-                write!(f, "nodes")
+                write!(f, "nodes"),
+            Command::Send =>
+                write!(f, "send"),
         }
     }
 }
@@ -106,6 +111,8 @@ impl Command {
                 Ok(Command::Stats),
             "nodes" =>
                 Ok(Command::Nodes),
+            "send" =>
+                Ok(Command::Send),
             _ =>
                 Err(CommandParseError::UnknownCommand(input))
         }
@@ -169,10 +176,22 @@ fn repl(_config: &Config, node_state: Arc<NodeState>) {
 fn execute(cmd: Command, node_state: Arc<NodeState>) {
     match cmd {
         Command::Nodes => {
-            match node_state.connected_nodes.lock() {
+            println!("connected:");
+            match node_state.connected_nodes_recv.lock() {
                 Ok(connected_nodes) => {
                     for (name, node_info) in &*connected_nodes {
-                        println!("{} : {}", name, node_info.uuid.to_string());
+                        println!("  {}: {}", name, node_info.node_info.address);
+                    }
+                    ()
+                }
+                Err(_) => {
+                    println!("cannot lock node map");
+                }
+            };
+            match node_state.connected_nodes_send.lock() {
+                Ok(connected_nodes) => {
+                    for (name, node_info) in &*connected_nodes {
+                        println!("  {}: {}", name, node_info.node_info.address);
                     }
                     ()
                 }
@@ -180,7 +199,37 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                     println!("cannot lock node map");
                 }
             }
-        }
+            println!("addresses:");
+            match node_state.address_map.lock() {
+                Ok(addr_map) => {
+                    for (name, addr) in &*addr_map {
+                        println!("  {}: {}", name, addr);
+                    }
+                    ()
+                }
+                Err(_) => {
+                    println!("cannot lock node map");
+                }
+            }
+        },
+        Command::Send => {
+            let mut us = Vec::new();
+            match node_state.connected_nodes_send.lock() {
+                Ok(connected_nodes) => {
+                    for (_, node_info) in &*connected_nodes {
+                        us.push(node_info.node_info.uuid);
+                    }
+                    ()
+                }
+                Err(_) => {
+                    println!("cannot lock node map");
+                }
+            }
+            for u in us {
+                send_message(node_state.clone(), &u,
+                             Message::Data(u, vec![41, 41, 41]));
+            }
+        },
         _ =>
             println!("You want me to {}?", cmd)
     };
