@@ -1,5 +1,6 @@
 extern crate peerington;
 extern crate env_logger;
+extern crate uuid;
 
 use peerington::parse_opts;
 use peerington::print_usage;
@@ -10,6 +11,8 @@ use peerington::Message;
 use peerington::start_listeners;
 use peerington::connect_seeds;
 use peerington::send_message;
+
+use uuid::Uuid;
 
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
@@ -49,23 +52,36 @@ fn main() {
             println!("workspace: {}", config.workspace_dir);
             println!("node uuid: {}", config.uuid.hyphenated());
 
-            match NodeState::new(&config) {
+            let conf = Arc::new(config);
+            match NodeState::new(conf.clone()) {
                 Ok(node_state) => {
                     let ns = Arc::new(node_state);
+                    let ns2 = ns.clone();
                     let (sender, receiver) = sync_channel(100);
                     thread::spawn(move || {
                         loop {
                             let d = receiver.recv().unwrap();
                             match d {
-                                Message::Data(u, v) => {
-                                    println!("received data from {}: {:?}", u, v);
+                                Message::Hello(u, addrs) => {
+                                    println!("received hello from {}: {:?}", u, addrs);
+                                    match ns2.address_map.lock() {
+                                        Ok(mut addr_map) => {
+                                            addr_map.insert(u, addrs);
+                                        }
+                                        Err(_) => {
+                                            println!("cannot lock address map");
+                                        }
+                                    };
+                                },
+                                Message::Broadcast(msg) => {
+                                    println!("broadcast: {}", msg);
                                 }
                             }
                         }
                     });
-                    start_listeners(&config, ns.clone(), sender);
-                    connect_seeds(&config, ns.clone());
-                    repl(&config, ns);
+                    start_listeners(ns.clone(), sender);
+                    connect_seeds(ns.clone());
+                    repl(conf, ns);
                     ()
                 },
                 Err(e) =>
@@ -83,8 +99,8 @@ enum Command {
     Stats,
     /// Print all known nodes.
     Nodes,
-    /// Broadcast a message.
-    Send,
+    /// Send a message to a specific node.
+    Send(Uuid, String),
 }
 
 impl fmt::Display for Command {
@@ -96,45 +112,64 @@ impl fmt::Display for Command {
                 write!(f, "stats"),
             Command::Nodes =>
                 write!(f, "nodes"),
-            Command::Send =>
-                write!(f, "send"),
+            Command::Send(ref u, ref s) =>
+                write!(f, "send {} {}", u, s),
         }
     }
 }
 
 impl Command {
     fn parse(input: &str) -> Result<Command, CommandParseError> {
-        match input {
-            "q" | "qu" | "qui" | "quit" =>
-                Ok(Command::Quit),
-            "s" | "st" | "sta" | "stat" | "stats" =>
-                Ok(Command::Stats),
-            "nodes" =>
-                Ok(Command::Nodes),
-            "send" =>
-                Ok(Command::Send),
-            _ =>
-                Err(CommandParseError::UnknownCommand(input))
+        let tokens: Vec<_> = input.split(' ').collect();
+        if tokens.len() > 0 {
+            match tokens[0] {
+                "q" | "qu" | "qui" | "quit" =>
+                    Ok(Command::Quit),
+                "s" | "st" | "sta" | "stat" | "stats" =>
+                    Ok(Command::Stats),
+                "nodes" =>
+                    Ok(Command::Nodes),
+                "send" => {
+                    if tokens.len() > 2 {
+                        if let Ok(u) = Uuid::parse_str(tokens[1]) {
+                            let msg = tokens[2];
+                            Ok(Command::Send(u, msg.to_string()))
+                        } else {
+                            Err(CommandParseError::Syntax("send UUID MSG"))
+                        }
+                    } else {
+                        Err(CommandParseError::Syntax("send UUID MSG"))
+                    }
+                },
+                _ =>  {
+                    Err(CommandParseError::UnknownCommand(tokens[0]))
+                }
+            }
+        } else {
+            Err(CommandParseError::Syntax("no command"))
         }
     }
 }
 
 /// Error produced when parsing a command fails.
 enum CommandParseError<'a>  {
-    UnknownCommand(&'a str)
+    UnknownCommand(&'a str),
+    Syntax(&'a str),
 }
 
 impl <'a> fmt::Display for CommandParseError<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             CommandParseError::UnknownCommand(s) =>
-                write!(f, "unknown command: {}", s)
+                write!(f, "unknown command: {}", s),
+            CommandParseError::Syntax(s) =>
+                write!(f, "invalid syntax: {}", s),
         }
     }
 }
 
 /// Read-eval-print loop of the peerington command.
-fn repl(_config: &Config, node_state: Arc<NodeState>) {
+fn repl(_config: Arc<Config>, node_state: Arc<NodeState>) {
     let prompt = b"peer> ";
     let mut input = String::new();
     
@@ -203,7 +238,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
             match node_state.address_map.lock() {
                 Ok(addr_map) => {
                     for (name, addr) in &*addr_map {
-                        println!("  {}: {}", name, addr);
+                        println!("  {}: {:?}", name, addr);
                     }
                     ()
                 }
@@ -212,23 +247,10 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                 }
             }
         },
-        Command::Send => {
-            let mut us = Vec::new();
-            match node_state.connected_nodes_send.lock() {
-                Ok(connected_nodes) => {
-                    for (_, node_info) in &*connected_nodes {
-                        us.push(node_info.node_info.uuid);
-                    }
-                    ()
-                }
-                Err(_) => {
-                    println!("cannot lock node map");
-                }
-            }
-            for u in us {
-                send_message(node_state.clone(), &u,
-                             Message::Data(u, vec![41, 41, 41]));
-            }
+        Command::Send(uuid, msg) => {
+            println!("sending...");
+            send_message(node_state, &uuid, Message::Broadcast(msg));
+            println!("sent.");
         },
         _ =>
             println!("You want me to {}?", cmd)
