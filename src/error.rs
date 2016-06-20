@@ -7,6 +7,7 @@ use std::error;
 use std::fmt;
 use std::string;
 
+use toml;
 use openssl::ssl;
 use uuid;
 
@@ -89,6 +90,9 @@ impl From<string::FromUtf8Error> for Error {
 
 /// Error values returned from the command line option parser.
 pub enum ConfigError {
+    /// IO error, for example when reading a configuration from a
+    /// file.
+    Io(io::Error),
     /// The user has given the `-h' or `--help' options.
     HelpRequested(super::getopts::Options),
     /// No listen address was specified.
@@ -101,12 +105,16 @@ pub enum ConfigError {
     InvalidUuid(super::uuid::ParseError),
     /// Some error during option parsing happened, for example an
     /// invalid option was given.
-    GetOptError(super::getopts::Fail)
+    GetOptError(super::getopts::Fail),
+    /// Error during config file parsing.
+    Toml(Vec<toml::ParserError>)
 }
 
-impl fmt::Display for ConfigError {
+impl fmt::Debug for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
+            ConfigError::Io(ref err) =>
+                write!(f, "IO error: {}", err),
             ConfigError::HelpRequested(_) =>
                 write!(f, "help requested"),
             ConfigError::NoListenAddress =>
@@ -118,8 +126,84 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidUuid(e) =>
                 write!(f, "UUID is invalid: {}", e),
             ConfigError::GetOptError(ref e) =>
-                write!(f, "{}", e)
+                write!(f, "{}", e),
+            ConfigError::Toml(ref e) =>
+                e.fmt(f)
         }
     }
 }
 
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            ConfigError::Io(ref err) =>
+                write!(f, "IO error: {}", err),
+            ConfigError::HelpRequested(_) =>
+                write!(f, "help requested"),
+            ConfigError::NoListenAddress =>
+                write!(f, "no listen address given"),
+            ConfigError::NoWorkspace =>
+                write!(f, "no workspace directory given"),
+            ConfigError::NoUuid =>
+                write!(f, "no node UUID given"),
+            ConfigError::InvalidUuid(e) =>
+                write!(f, "UUID is invalid: {}", e),
+            ConfigError::GetOptError(ref e) =>
+                write!(f, "{}", e),
+            ConfigError::Toml(_) =>
+                write!(f, "toml error")
+        }
+    }
+}
+
+impl error::Error for ConfigError {
+    fn description(&self) -> &str {
+        // Both underlying errors already impl `Error`, so we defer to their
+        // implementations.
+        match *self {
+            ConfigError::Io(ref err) =>
+                err.description(),
+            ConfigError::HelpRequested(_) =>
+                "help requested",
+            ConfigError::NoListenAddress =>
+                "no listen address given",
+            ConfigError::NoWorkspace =>
+                "no workspace directory given",
+            ConfigError::NoUuid =>
+                "no node UUID given",
+            ConfigError::InvalidUuid(_) =>
+                "invalid uuid",
+            ConfigError::GetOptError(_) =>
+                "option parsing error",
+            ConfigError::Toml(_) =>
+                "toml parse error"
+        }
+    }
+
+    fn cause(&self) -> Option<&error::Error> {
+        match *self {
+            ConfigError::Io(ref err) =>
+                Some(err),
+            ConfigError::HelpRequested(_) =>
+                None,
+            ConfigError::NoListenAddress =>
+                None,
+            ConfigError::NoWorkspace =>
+                None,
+            ConfigError::NoUuid =>
+                None,
+            ConfigError::InvalidUuid(_) =>
+                None,
+            ConfigError::GetOptError(ref e) =>
+                e.cause(),
+            ConfigError::Toml(_) =>
+                None
+        }
+    }
+}
+
+impl From<io::Error> for ConfigError {
+    fn from(err: io::Error) -> ConfigError {
+        ConfigError::Io(err)
+    }
+}

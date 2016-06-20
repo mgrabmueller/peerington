@@ -1,0 +1,4 @@
+[node]
+uuid = "9b5700fa-5ba2-46be-bb2a-a809a009c63c"
+listen-addresses = ["localhost:1234"]
+workspace-directory = "examples/ws0"

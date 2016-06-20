@@ -8,6 +8,7 @@ extern crate uuid;
 extern crate getopts;
 extern crate openssl;
 extern crate byteorder;
+extern crate toml;
 
 use uuid::Uuid;
 use getopts::Options;
@@ -22,6 +23,8 @@ use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::fs::File;
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
@@ -249,6 +252,36 @@ impl NodeState {
     }
 }
 
+/// Configuration as parsed on the command line.
+pub struct CmdLineConfig {
+    /// UUID of the node.
+    pub uuid: Option<Uuid>,
+    /// The addresses this node will attempt to listen on.
+    pub listen_addresses: Vec<String>,
+    /// The addresses this node will use to connect to a cluster of
+    /// peerington nodes.
+    pub seed_addresses: Vec<String>,
+    /// Local storage space where some data is stored during
+    /// operation.
+    pub workspace_dir: Option<String>,
+    /// Location of the config file.
+    pub config_file: Option<String>,
+}
+
+/// Configuration as parsed from config file.
+pub struct FileConfig {
+    /// UUID of the node.
+    pub uuid: Option<Uuid>,
+    /// The addresses this node will attempt to listen on.
+    pub listen_addresses: Vec<String>,
+    /// The addresses this node will use to connect to a cluster of
+    /// peerington nodes.
+    pub seed_addresses: Vec<String>,
+    /// Local storage space where some data is stored during
+    /// operation.
+    pub workspace_dir: Option<String>
+}
+
 /// Configuration of a peerington node.
 pub struct Config {
     /// UUID of the node.
@@ -263,11 +296,190 @@ pub struct Config {
     pub workspace_dir: String
 }
 
+/// Parse config file in TOML format. Either return a `FileConfig'
+/// value or an error. Note that in config files, some values are
+/// optional which are not optional on the command line.
+pub fn parse_config<P: AsRef<Path>>(fname: P) -> Result<FileConfig, error::ConfigError> {
+    let mut file = try!(File::open(fname));
+    let mut s = String::new();
+    try!(file.read_to_string(&mut s));
+    let mut parser = toml::Parser::new(&s);
+    match parser.parse() {
+        None =>
+            Err(error::ConfigError::Toml(parser.errors)),
+        Some(ref value) => {
+            match value.get("node") {
+                Some(ref node_config) => {
+                    match node_config.as_table() {
+                        Some(ref node_table) => {
+                            let workspace =
+                                match node_table.get("workspace-directory") {
+                                    None => None,
+                                    Some(s) =>
+                                        match s.as_str() {
+                                            None => {
+                                                error!("invalid workspace-directory entry in config file - ignoring");
+                                                None
+                                            },
+                                            Some(s) => Some(String::from(s))
+                                        }
+                                };
+                                       
+                            let uuid =
+                                match node_table.get("uuid") {
+                                    None => None,
+                                    Some(u) =>
+                                        match u.as_str() {
+                                            None => {
+                                                error!("invalid uuid entry in config file - ignoring");
+                                                None
+                                            },
+                                            Some(u) =>
+                                                match Uuid::parse_str(u.chars().as_str()) {
+                                                    Ok(u) => {
+                                                        Some(u)
+                                                    }
+                                                    Err(_) => {
+                                                        error!("invalid uuid entry in config file - ignoring");
+                                                        None
+                                                    }
+                                                }
+                                        }
+                                };
+                                            
+                            let listen_addresses =
+                                match node_table.get("listen-addresses") {
+                                    None => vec![],
+                                    Some(la) =>
+                                        match la.as_slice() {
+                                            None => {
+                                                error!("invalid listen-addresses entry in config file - ignoring");
+                                                vec![]
+                                            },
+                                            Some(la) => {
+                                                let mut v = Vec::new();
+                                                for s in la {
+                                                    match s.as_str() {
+                                                        None => {
+                                                            error!("invalid listen-addresses entry in config file - ignoring");
+                                                        },
+                                                        Some(s) => v.push(String::from(s))
+                                                    }
+                                                };
+                                                v
+                                            }
+                                        }
+                                };
+                            let seed_addresses = 
+                                match node_table.get("seed-addresses") {
+                                    None => vec![],
+                                    Some(sa) =>
+                                        match sa.as_slice() {
+                                            None => {
+                                                error!("invalid seed-addresses entry in config file - ignoring");
+                                                vec![]
+                                            },
+                                            Some(sa) => {
+                                                let mut v = Vec::new();
+                                                for s in sa {
+                                                    match s.as_str() {
+                                                        None => {
+                                                            error!("invalid seed-addresses entry in config file - ignoring");
+                                                        },
+                                                        Some(s) => v.push(String::from(s))
+                                                    }
+                                                }
+                                                v
+                                            }
+                                        }
+                                };
+                            Ok(FileConfig{
+                                workspace_dir: workspace,
+                                uuid: uuid,
+                                seed_addresses: seed_addresses,
+                                listen_addresses: listen_addresses})
+                        },
+                        _ => {
+                            Ok(FileConfig{
+                                workspace_dir: None,
+                                uuid: None,
+                                seed_addresses: vec![],
+                                listen_addresses: vec![]})
+                        }
+                    }
+                },
+                _ =>
+                    Ok(FileConfig{
+                        workspace_dir: None,
+                        uuid: None,
+                        seed_addresses: vec![],
+                        listen_addresses: vec![]})
+            }
+        }
+    }
+}
+
+/// Merges command line options and settings from a TOML config file
+/// into a `Config' value.  Command line options have precedence, that
+/// means that if a value is set both on the command line and in the
+/// config file, the value on the command line is used.  Note
+/// especially that lists of values (like listen and seed addresses)
+/// are not appended.
+pub fn merge_configs(cmd_config: &CmdLineConfig, file_config: &FileConfig) ->
+    Result<Config, error::ConfigError>
+{
+
+    let workspace_dir =
+        match cmd_config.workspace_dir {
+            Some(ref d) =>
+                d.clone(),
+            None =>
+                match file_config.workspace_dir {
+                    Some(ref d) =>
+                        d.clone(),
+                    None =>
+                        return Err(error::ConfigError::NoWorkspace)
+                }
+        };
+    let uuid =
+        match cmd_config.uuid {
+            Some(u) => u,
+            None =>
+                match file_config.uuid {
+                    Some(u) => u,
+                    None => return Err(error::ConfigError::NoUuid)
+                }
+        };
+    let listen_addresses =
+        if cmd_config.listen_addresses.len() > 0 {
+            cmd_config.listen_addresses.clone()
+        } else if file_config.listen_addresses.len() > 0 {
+            file_config.listen_addresses.clone()
+        } else {
+            return Err(error::ConfigError::NoListenAddress)
+        };
+    let seed_addresses = 
+        if cmd_config.seed_addresses.len() > 0 {
+            cmd_config.seed_addresses.clone()
+        } else {
+            file_config.seed_addresses.clone()
+        };
+    Ok(Config{
+        uuid: uuid,
+        workspace_dir: workspace_dir,
+        listen_addresses: listen_addresses,
+        seed_addresses: seed_addresses,
+    })
+}
+
 /// Parse allowed options for a peerington node.  Either return a
-/// complete `Config' value or an error value.
-pub fn parse_opts(args: Vec<String>) -> Result<Config, error::ConfigError> {
+/// complete `Config' value or an error value.  Note that on the
+/// command line, other values might be optional than in a config
+/// file.
+pub fn parse_opts(args: Vec<String>) -> Result<CmdLineConfig, error::ConfigError> {
 
     let mut opts = Options::new();
+    opts.optopt("c", "config", "set config file", "FILE");
     opts.optopt("u", "uuid", "set node uuid", "UUID");
     opts.optopt("w", "workspace", "set workspace directory", "DIRECTORY");
     opts.optmulti("l", "listen", "set listen address(es)", "ADDRESS:PORT");
@@ -280,28 +492,25 @@ pub fn parse_opts(args: Vec<String>) -> Result<Config, error::ConfigError> {
                 return Err(error::ConfigError::HelpRequested(opts));
             }
 
-            let addresses = if matches.opt_present("l") {
-                matches.opt_strs("l")
-            } else {
-                return Err(error::ConfigError::NoListenAddress);
-            };
+            let addresses = matches.opt_strs("l");
 
             let seeds = matches.opt_strs("s");
 
-            let workspace =
-                match matches.opt_str("w") {
-                    Some(w) => w,
-                    None => {
-                        return Err(error::ConfigError::NoWorkspace);
-                    }
-                };
+            let workspace = matches.opt_str("w");
+            let config = matches.opt_str("c");
+            match (workspace.clone(), config.clone()) {
+                (None, None) =>
+                    return Err(error::ConfigError::NoWorkspace),
+                (_, _) => {
+                }
+            };
 
             let uuid =
                 match matches.opt_str("u") {
                     Some(uuid) => {
                         match Uuid::parse_str(uuid.chars().as_str()) {
                             Ok(u) => {
-                                u
+                                Some(u)
                             }
                             Err(e) => {
                                 return Err(error::ConfigError::InvalidUuid(e));
@@ -309,14 +518,15 @@ pub fn parse_opts(args: Vec<String>) -> Result<Config, error::ConfigError> {
                         }
                     },
                     None => {
-                        return Err(error::ConfigError::NoUuid);
+                        None
                     }
                 };
 
-            return Ok(Config {
+            return Ok(CmdLineConfig {
                 listen_addresses: addresses,
                 seed_addresses: seeds,
                 workspace_dir: workspace,
+                config_file: config,
                 uuid: uuid
             });
         }

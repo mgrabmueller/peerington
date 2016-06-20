@@ -3,6 +3,8 @@ extern crate env_logger;
 extern crate uuid;
 
 use peerington::parse_opts;
+use peerington::parse_config;
+use peerington::merge_configs;
 use peerington::print_usage;
 use peerington::error::ConfigError;
 use peerington::Config;
@@ -14,6 +16,7 @@ use peerington::send_message;
 
 use uuid::Uuid;
 
+use std::path::Path;
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::env;
@@ -40,54 +43,87 @@ fn main() {
             return;
         }
 
-        Ok(config) => {
-            println!("listening on:");
-            for ref a in &config.listen_addresses {
-                println!("  {}", a);
-            }
-            println!("configured seeds:");
-            for ref a in &config.seed_addresses {
-                println!("  {}", a);
-            }
-            println!("workspace: {}", config.workspace_dir);
-            println!("node uuid: {}", config.uuid.hyphenated());
-
-            let conf = Arc::new(config);
-            match NodeState::new(conf.clone()) {
-                Ok(node_state) => {
-                    let ns = Arc::new(node_state);
-                    let ns2 = ns.clone();
-                    let (sender, receiver) = sync_channel(100);
-                    thread::spawn(move || {
-                        loop {
-                            let d = receiver.recv().unwrap();
-                            match d {
-                                Message::Hello(u, addrs) => {
-                                    println!("received hello from {}: {:?}", u, addrs);
-                                    match ns2.address_map.lock() {
-                                        Ok(mut addr_map) => {
-                                            addr_map.insert(u, addrs);
-                                        }
-                                        Err(_) => {
-                                            println!("cannot lock address map");
-                                        }
-                                    };
-                                },
-                                Message::Broadcast(msg) => {
-                                    println!("broadcast: {}", msg);
-                                }
+        Ok(cmd_config) => {
+            let path =
+                match cmd_config.config_file {
+                    Some(ref cf) => Path::new(cf).to_path_buf(),
+                    None =>
+                        match cmd_config.workspace_dir {
+                            Some(ref wd) =>
+                                Path::new(&wd.clone()).join("peerington.toml"),
+                            None => {
+                                println!("the impossible has happened");
+                                return;
                             }
                         }
-                    });
-                    start_listeners(ns.clone(), sender);
-                    connect_seeds(ns.clone());
-                    repl(conf, ns);
-                    ()
+                };
+            match parse_config(&path) {
+                Err(e) => {
+                    println!("error reading config file: {}", e);
+                    return;
                 },
-                Err(e) =>
-                    println!("cannot create node state: {}", e)
-            };
+                Ok(file_config) => {
+                    let config =
+                        match merge_configs(&cmd_config, &file_config) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                println!("error merging configs: {}", e);
+                                return
+                            }
+                        };
+                    run(config);
+                }
+            }
         }
+    }
+}
+
+fn run(config: Config) {
+    println!("listening on:");
+    for ref a in &config.listen_addresses {
+        println!("  {}", a);
+    }
+    println!("configured seeds:");
+    for ref a in &config.seed_addresses {
+        println!("  {}", a);
+    }
+    println!("workspace: {}", config.workspace_dir);
+    println!("node uuid: {}", config.uuid.hyphenated());
+    
+    let conf = Arc::new(config);
+    match NodeState::new(conf.clone()) {
+        Ok(node_state) => {
+            let ns = Arc::new(node_state);
+            let ns2 = ns.clone();
+            let (sender, receiver) = sync_channel(100);
+            thread::spawn(move || {
+                loop {
+                    let d = receiver.recv().unwrap();
+                    match d {
+                        Message::Hello(u, addrs) => {
+                            println!("received hello from {}: {:?}", u, addrs);
+                            match ns2.address_map.lock() {
+                                Ok(mut addr_map) => {
+                                    addr_map.insert(u, addrs);
+                                }
+                                Err(_) => {
+                                    println!("cannot lock address map");
+                                }
+                            };
+                        },
+                        Message::Broadcast(msg) => {
+                            println!("broadcast: {}", msg);
+                        }
+                    }
+                }
+            });
+            start_listeners(ns.clone(), sender);
+            connect_seeds(ns.clone());
+            repl(conf, ns);
+            ()
+        },
+        Err(e) =>
+            println!("cannot create node state: {}", e)
     }
 }
 
