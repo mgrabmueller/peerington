@@ -107,7 +107,9 @@ pub enum ConfigError {
     /// invalid option was given.
     GetOptError(super::getopts::Fail),
     /// Error during config file parsing.
-    Toml(Vec<toml::ParserError>)
+    Toml(Vec<toml::ParserError>),
+    /// Config file is not valid.
+    InvalidConfig(&'static str),
 }
 
 impl fmt::Debug for ConfigError {
@@ -128,7 +130,9 @@ impl fmt::Debug for ConfigError {
             ConfigError::GetOptError(ref e) =>
                 write!(f, "{}", e),
             ConfigError::Toml(ref e) =>
-                e.fmt(f)
+                e.fmt(f),
+            ConfigError::InvalidConfig(s) =>
+                write!(f, "invalid config: {}", s),
         }
     }
 }
@@ -151,7 +155,9 @@ impl fmt::Display for ConfigError {
             ConfigError::GetOptError(ref e) =>
                 write!(f, "{}", e),
             ConfigError::Toml(_) =>
-                write!(f, "toml error")
+                write!(f, "toml error"),
+            ConfigError::InvalidConfig(s) =>
+                write!(f, "invalid config: {}", s),
         }
     }
 }
@@ -176,7 +182,9 @@ impl error::Error for ConfigError {
             ConfigError::GetOptError(_) =>
                 "option parsing error",
             ConfigError::Toml(_) =>
-                "toml parse error"
+                "toml parse error",
+            ConfigError::InvalidConfig(s) =>
+                s,
         }
     }
 
@@ -197,7 +205,9 @@ impl error::Error for ConfigError {
             ConfigError::GetOptError(ref e) =>
                 e.cause(),
             ConfigError::Toml(_) =>
-                None
+                None,
+            ConfigError::InvalidConfig(_) =>
+                None,
         }
     }
 }

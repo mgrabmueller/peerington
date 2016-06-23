@@ -1,13 +1,15 @@
+// Copyright 2016 Martin Grabmueller. See the LICENSE file at the
+// top-level directory of this distribution for license information.
+//
+
 extern crate peerington;
 extern crate env_logger;
 extern crate uuid;
 
-use peerington::parse_opts;
-use peerington::parse_config;
-use peerington::merge_configs;
-use peerington::print_usage;
+use peerington::config::get_config;
+use peerington::config::print_usage;
 use peerington::error::ConfigError;
-use peerington::Config;
+use peerington::config::Config;
 use peerington::NodeState;
 use peerington::Message;
 use peerington::start_listeners;
@@ -16,7 +18,6 @@ use peerington::send_message;
 
 use uuid::Uuid;
 
-use std::path::Path;
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::env;
@@ -32,49 +33,17 @@ fn main() {
     let program = args[0].clone();
 
 
-    match parse_opts(args) {
+    match get_config(args) {
         Err(ConfigError::HelpRequested(opts)) => {
             print_usage(&program, opts);
-            return;
         }
 
         Err(e) => {
             println!("Error: {}", e);
-            return;
         }
 
-        Ok(cmd_config) => {
-            let path =
-                match cmd_config.config_file {
-                    Some(ref cf) => Path::new(cf).to_path_buf(),
-                    None =>
-                        match cmd_config.workspace_dir {
-                            Some(ref wd) =>
-                                Path::new(&wd.clone()).join("peerington.toml"),
-                            None => {
-                                println!("the impossible has happened");
-                                return;
-                            }
-                        }
-                };
-            match parse_config(&path) {
-                Err(e) => {
-                    println!("error reading config file: {}", e);
-                    return;
-                },
-                Ok(file_config) => {
-                    let config =
-                        match merge_configs(&cmd_config, &file_config) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                println!("error merging configs: {}", e);
-                                return
-                            }
-                        };
-                    run(config);
-                }
-            }
-        }
+        Ok(config) =>
+            run(config)
     }
 }
 
