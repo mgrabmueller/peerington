@@ -10,21 +10,18 @@ use peerington::config::get_config;
 use peerington::config::print_usage;
 use peerington::error::ConfigError;
 use peerington::config::Config;
-use peerington::NodeState;
-use peerington::Message;
-use peerington::start_listeners;
-use peerington::connect_seeds;
-use peerington::send_message;
+use peerington::node::NodeState;
+use peerington::node::start_networking;
+use peerington::node::send_message;
+use peerington::message::Message;
 
 use uuid::Uuid;
 
-use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::env;
 use std::io;
 use std::io::Write;
 use std::fmt;
-use std::thread;
 
 fn main() {
     env_logger::init().unwrap();
@@ -47,6 +44,17 @@ fn main() {
     }
 }
 
+fn handler(msg: Message) {
+    match msg {
+        Message::Broadcast(msg) => {
+            println!("broadcast: {}", msg);
+        },
+        _ => {
+            println!("error: unknown message: {:?}", msg)
+        }
+    }
+}
+
 fn run(config: Config) {
     println!("listening on:");
     for ref a in &config.listen_addresses {
@@ -63,31 +71,7 @@ fn run(config: Config) {
     match NodeState::new(conf.clone()) {
         Ok(node_state) => {
             let ns = Arc::new(node_state);
-            let ns2 = ns.clone();
-            let (sender, receiver) = sync_channel(100);
-            thread::spawn(move || {
-                loop {
-                    let d = receiver.recv().unwrap();
-                    match d {
-                        Message::Hello(u, addrs) => {
-                            println!("received hello from {}: {:?}", u, addrs);
-                            match ns2.address_map.lock() {
-                                Ok(mut addr_map) => {
-                                    addr_map.insert(u, addrs);
-                                }
-                                Err(_) => {
-                                    println!("cannot lock address map");
-                                }
-                            };
-                        },
-                        Message::Broadcast(msg) => {
-                            println!("broadcast: {}", msg);
-                        }
-                    }
-                }
-            });
-            start_listeners(ns.clone(), sender);
-            connect_seeds(ns.clone());
+            start_networking(ns.clone(), handler);
             repl(conf, ns);
             ()
         },

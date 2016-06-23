@@ -293,3 +293,97 @@ pub fn get_config(args: Vec<String>) ->
         }
     }
 }
+
+mod test {
+    #[allow(unused_imports)]
+    use super::*;
+
+    #[test]
+    fn no_listen() {
+        let ok = match parse_opts(vec!["prog".to_string()]) {
+            Err(error::ConfigError::NoListenAddress) => true,
+            _ => false
+        };
+        assert!(ok);
+    }
+
+    #[test]
+    fn no_workspace() {
+        let ok = match parse_opts(vec!["prog".to_string(),
+                                       "--listen=localhost:1234".to_string()]) {
+            Err(error::ConfigError::NoWorkspace) => true,
+            _ => false
+        };
+        assert!(ok);
+    }
+
+    #[test]
+    fn no_uuid() {
+        let ok = match parse_opts(vec!["prog".to_string(),
+                                       "--listen=localhost:1234".to_string(),
+                                       "--workspace=space".to_string()]) {
+            Err(error::ConfigError::NoUuid) => true,
+            _ => false
+        };
+        assert!(ok);
+    }
+
+    #[test]
+    fn invalid_uuid() {
+        let ok = match parse_opts(vec!["prog".to_string(),
+                                       "--listen=localhost:1234".to_string(),
+                                       "--workspace=space".to_string(),
+                                       "--uuid=abcde".to_string()]) {
+            Err(error::ConfigError::InvalidUuid(_)) => true,
+            _ => false
+        };
+        assert!(ok);
+    }
+
+    #[test]
+    fn invalid_arg() {
+        let ok = match parse_opts(vec!["prog".to_string(), "--hepl".to_string()]) {
+            Err(error::ConfigError::GetOptError(_)) => true,
+            _ => false
+        };
+        assert!(ok);
+    }
+
+    #[test]
+    fn help_arg() {
+        let ok = match parse_opts(vec!["prog".to_string(), "-h".to_string()]) {
+            Err(error::ConfigError::HelpRequested(_)) => true,
+            _ => false
+        };
+        assert!(ok);
+    }
+
+    #[test]
+    fn long_help_arg() {
+        let ok = match parse_opts(vec!["prog".to_string(), "--help".to_string()]) {
+            Err(error::ConfigError::HelpRequested(_)) => true,
+            _ => false
+        };
+        assert!(ok);
+    }
+
+    #[test]
+    fn all_fine() {
+        match parse_opts(vec!["prog".to_string(),
+                              "--listen=localhost:1234".to_string(),
+                              "--workspace=space".to_string(),
+                              "--uuid=33d92212-7bf3-4573-8052-17789f520240".to_string()]) {
+            Ok(config) => {
+                assert!(config.listen_addresses.len() >= 1);
+                for a in config.listen_addresses {
+                    assert!(a.len() > 0);
+                }
+                assert!(config.workspace_dir.len() >= 1);
+            }
+            _ => {
+                assert!(false);
+            }
+        };
+    }
+
+}
