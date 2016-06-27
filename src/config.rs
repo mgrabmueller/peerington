@@ -48,7 +48,7 @@ pub struct FileConfig {
     pub seed_addresses: Vec<String>,
     /// Local storage space where some data is stored during
     /// operation.
-    pub workspace_dir: Option<String>
+    pub workspace_dir: Option<String>,
 }
 
 /// Configuration of a peerington node.
@@ -62,58 +62,59 @@ pub struct Config {
     pub seed_addresses: Vec<String>,
     /// Local storage space where some data is stored during
     /// operation.
-    pub workspace_dir: String
+    pub workspace_dir: String,
 }
 
 fn extract_config(value: &toml::Table) -> Result<FileConfig, error::ConfigError> {
     fn extract_string_list(node_table: &toml::Table,
                            field_name: &str) -> Vec<String> {
         node_table.get(field_name)
-            .and_then(|la| la.as_slice())
-            .and_then(|la| {
-                let mut v = Vec::new();
-                for s in la {
-                    match s.as_str() {
-                        None => {
-                            error!("invalid {} entry in config file - ignoring",
-                                   field_name);
-                        },
-                        Some(s) => v.push(String::from(s))
-                    }
-                };
-                Some(v)
-            })
-            .or_else(|| {
-                error!("invalid {} entry in config file - ignoring",
-                       field_name);
-                None
-            }).unwrap_or(vec![])
+            .and_then(|la| la.as_slice()
+                      .and_then(|la| {
+                          let mut v = Vec::new();
+                          for s in la {
+                              match s.as_str() {
+                                  None => {
+                                      error!("invalid {} entry in config file - ignoring",
+                                             field_name);
+                                  },
+                                  Some(s) => v.push(String::from(s))
+                              }
+                          };
+                          Some(v)
+                      })
+                      .or_else(|| {
+                          error!("invalid {} entry in config file - ignoring",
+                                 field_name);
+                          None
+                      }))
+            .unwrap_or(vec![])
     }
     value.get("node")
         .and_then(|node_config| node_config.as_table())
         .and_then(|node_table| {
             let workspace =
                 node_table.get("workspace-directory")
-                .and_then(|s| s.as_str())
-                .or_else(|| {
-                    error!("invalid workspace-directory entry in config file - ignoring");
-                    None
-                })
-                .and_then(|s| Some(String::from(s)));
+                .and_then(|s| s.as_str()
+                          .or_else(|| {
+                              error!("invalid workspace-directory entry in config file - ignoring");
+                              None
+                          })
+                          .and_then(|s| Some(String::from(s))));
 
             let uuid =
                 node_table.get("uuid")
-                .and_then(|u| u.as_str())
-                .or_else(|| {
-                    error!("invalid uuid entry in config file - ignoring");
-                    None
-                })
-                .and_then(|u|
-                          Uuid::parse_str(u.chars().as_str())
-                          .map_err(|e| {
-                              error!("invalid uuid entry in config file: {} - ignoring", e);
-                              e
-                          }).ok());
+                .and_then(|u| u.as_str()
+                          .or_else(|| {
+                              error!("invalid uuid entry in config file - ignoring");
+                              None
+                          })
+                          .and_then(|u|
+                                    Uuid::parse_str(u.chars().as_str())
+                                    .map_err(|e| {
+                                        error!("invalid uuid entry in config file: {} - ignoring", e);
+                                        e
+                                    }).ok()));
 
             let listen_addresses = extract_string_list(node_table,
                                                        "listen-addresses");
@@ -123,7 +124,8 @@ fn extract_config(value: &toml::Table) -> Result<FileConfig, error::ConfigError>
                 workspace_dir: workspace,
                 uuid: uuid,
                 seed_addresses: seed_addresses,
-                listen_addresses: listen_addresses})
+                listen_addresses: listen_addresses,
+            })
         }).ok_or(error::ConfigError::InvalidConfig("required entry missing: node"))
 
 }

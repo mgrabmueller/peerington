@@ -17,6 +17,7 @@ use peerington::message::Message;
 
 use uuid::Uuid;
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::env;
 use std::io;
@@ -56,17 +57,6 @@ fn handler(msg: Message) {
 }
 
 fn run(config: Config) {
-    println!("listening on:");
-    for ref a in &config.listen_addresses {
-        println!("  {}", a);
-    }
-    println!("configured seeds:");
-    for ref a in &config.seed_addresses {
-        println!("  {}", a);
-    }
-    println!("workspace: {}", config.workspace_dir);
-    println!("node uuid: {}", config.uuid.hyphenated());
-    
     let conf = Arc::new(config);
     match NodeState::new(conf.clone()) {
         Ok(node_state) => {
@@ -90,6 +80,10 @@ enum Command {
     Nodes,
     /// Send a message to a specific node.
     Send(Uuid, String),
+    /// Show configuration.
+    Config,
+    /// Show information on all known peers.
+    Peers,
 }
 
 impl fmt::Display for Command {
@@ -103,6 +97,10 @@ impl fmt::Display for Command {
                 write!(f, "nodes"),
             Command::Send(ref u, ref s) =>
                 write!(f, "send {} {}", u, s),
+            Command::Config =>
+                write!(f, "config"),
+            Command::Peers =>
+                write!(f, "peers"),
         }
     }
 }
@@ -118,6 +116,10 @@ impl Command {
                     Ok(Command::Stats),
                 "nodes" =>
                     Ok(Command::Nodes),
+                "config" =>
+                    Ok(Command::Config),
+                "p" | "pe" | "pee" | "peer" | "peers" =>
+                    Ok(Command::Peers),
                 "send" => {
                     if tokens.len() > 2 {
                         if let Ok(u) = Uuid::parse_str(tokens[1]) {
@@ -200,29 +202,6 @@ fn repl(_config: Arc<Config>, node_state: Arc<NodeState>) {
 fn execute(cmd: Command, node_state: Arc<NodeState>) {
     match cmd {
         Command::Nodes => {
-            println!("connected:");
-            match node_state.connected_nodes_recv.lock() {
-                Ok(connected_nodes) => {
-                    for (name, node_info) in &*connected_nodes {
-                        println!("  {}: {}", name, node_info.node_info.address);
-                    }
-                    ()
-                }
-                Err(_) => {
-                    println!("cannot lock node map");
-                }
-            };
-            match node_state.connected_nodes_send.lock() {
-                Ok(connected_nodes) => {
-                    for (name, node_info) in &*connected_nodes {
-                        println!("  {}: {}", name, node_info.node_info.address);
-                    }
-                    ()
-                }
-                Err(_) => {
-                    println!("cannot lock node map");
-                }
-            }
             println!("addresses:");
             match node_state.address_map.lock() {
                 Ok(addr_map) => {
@@ -240,6 +219,36 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
             println!("sending...");
             send_message(node_state, &uuid, Message::Broadcast(msg));
             println!("sent.");
+        },
+        Command::Config => {
+            let config = &node_state.config;
+            println!("listening on:");
+            for ref a in &config.listen_addresses {
+                println!("  {}", a);
+            }
+            println!("configured seeds:");
+            for ref a in &config.seed_addresses {
+                println!("  {}", a);
+            }
+            println!("workspace: {}", config.workspace_dir);
+            println!("node uuid: {}", config.uuid.hyphenated());
+            },
+        Command::Peers => {
+            match node_state.peers.lock() {
+                Ok(peers) => {
+                    println!("uuid                               rcv snd");
+                    for (name, peer_state) in &*peers {
+                        println!("{} {} {}", name,
+                                 peer_state.recv_conns.load(Ordering::Relaxed),
+                                 peer_state.send_conns.load(Ordering::Relaxed)
+                        );
+                    }
+                    ()
+                }
+                Err(_) => {
+                    println!("cannot lock node map");
+                }
+            }
         },
         _ =>
             println!("You want me to {}?", cmd)
