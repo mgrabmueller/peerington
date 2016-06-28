@@ -2,6 +2,8 @@
 // top-level directory of this distribution for license information.
 //
 
+extern crate rand;
+
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::collections::BTreeMap;
@@ -18,6 +20,9 @@ use std::sync::mpsc::Receiver;
 use std::sync::mpsc::sync_channel;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time;
+
+use self::rand::Rng;
 
 use openssl::ssl;
 use openssl::nid;
@@ -30,11 +35,21 @@ use super::config;
 use super::error;
 use super::node;
 
+#[derive(Debug, Clone, Copy)]
+pub enum Availability {
+    Up,
+    Down,
+}
+
 pub struct PeerState {
     pub uuid: Uuid,
     pub recv_conns: AtomicUsize,
     pub send_conns: AtomicUsize,
     pub send_channel: Option<SyncSender<message::Message>>,
+    pub send_errors: AtomicUsize,
+    pub recv_errors: AtomicUsize,
+    pub connect_errors: AtomicUsize,
+    pub availability: Availability,
 }
 
 pub struct NodeState {
@@ -235,15 +250,30 @@ pub fn send_message(node_state: Arc<node::NodeState>,
                 Some(addrs) => {
                     if addrs.len() > 0 {
                         let addr = &addrs[0];
-                        connect_to_node(node_state.clone(), addr);
-                        let tx = node::find_send_channel(node_state, to);
-                        match tx {
-                            Some(tx) => {
-                                tx.send(message).expect(
-                                    &format!("could not send internal message to {}", to))
-                            },
-                            None => {
-                                error!("could not connect to node: {}", to);
+                        let connected = connect_to_node(node_state.clone(), addr);
+                        if connected {
+                            {
+                                let mut peers = node_state.peers.lock().unwrap();
+                                let mut peer = peers.get_mut(&to).unwrap();
+                                peer.connect_errors.store(0, Ordering::Relaxed);
+                                peer.availability = Availability::Up;
+                            }
+                            let tx = node::find_send_channel(node_state, to);
+                            match tx {
+                                Some(tx) => {
+                                    tx.send(message).expect(
+                                        &format!("could not send internal message to {}", to))
+                                },
+                                None => {
+                                    error!("could not connect to node: {}", to);
+                                }
+                            }
+                        } else {
+                            {
+                                let mut peers = node_state.peers.lock().unwrap();
+                                let mut peer = peers.get_mut(&to).unwrap();
+                                peer.connect_errors.fetch_add(1, Ordering::Relaxed);
+                                peer.availability = Availability::Down;
                             }
                         }
                     } else {
@@ -259,7 +289,7 @@ pub fn send_message(node_state: Arc<node::NodeState>,
 }
 
 
-fn recv_handler_loop(_node_state: Arc<node::NodeState>, _uuid: Uuid,
+fn recv_handler_loop(node_state: Arc<node::NodeState>, uuid: &Uuid,
                      stream: &mut ssl::SslStream<TcpStream>, sender: SyncSender<message::Message>) {
     let mut buf = [33; 1024];
     let mut msg = Vec::new();
@@ -282,9 +312,17 @@ fn recv_handler_loop(_node_state: Arc<node::NodeState>, _uuid: Uuid,
                         sender.send(m).unwrap();
                     }
                 }
+                {
+                    let peers = node_state.peers.lock().unwrap();
+                    peers.get(&uuid).unwrap().recv_errors.store(0, Ordering::Relaxed);
+                }
             },
             Err(e) => {
                 error!("error when reading: {}", e);
+                {
+                    let peers = node_state.peers.lock().unwrap();
+                    peers.get(&uuid).unwrap().recv_errors.fetch_add(1, Ordering::Relaxed);
+                }
                 break;
             }
         }
@@ -293,7 +331,8 @@ fn recv_handler_loop(_node_state: Arc<node::NodeState>, _uuid: Uuid,
 
 /// This loop repeatedly takes messages from the given Receiver,
 /// encodes them and sends them over the connection.
-fn send_handler_loop(_node_state: Arc<node::NodeState>,
+fn send_handler_loop(node_state: Arc<node::NodeState>,
+                     uuid: &Uuid,
                      stream: &mut ssl::SslStream<TcpStream>,
                      rx: Receiver<message::Message>) {
     loop {
@@ -306,13 +345,26 @@ fn send_handler_loop(_node_state: Arc<node::NodeState>,
                         let v = c.into_inner();
                         let n = v.len();
                         match stream.ssl_write(&v) {
-                            Ok(x) =>
+                            Ok(x) => {
                                 if x != n {
                                     error!("could not write everything");
+                                    {
+                                        let peers = node_state.peers.lock().unwrap();
+                                        peers.get(&uuid).unwrap().send_errors.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     return;
-                                },
+                                }
+                                {
+                                    let peers = node_state.peers.lock().unwrap();
+                                    peers.get(&uuid).unwrap().send_errors.store(0, Ordering::Relaxed);
+                                }
+                            },
                             Err(e) => {
                                 error!("error when writing: {}", e);
+                                {
+                                    let peers = node_state.peers.lock().unwrap();
+                                    peers.get(&uuid).unwrap().send_errors.fetch_add(1, Ordering::Relaxed);
+                                }
                                 return;
                             }
                         }
@@ -369,11 +421,15 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                     peers.entry(u).or_insert_with(|| PeerState{uuid: u,
                                                                recv_conns: AtomicUsize::new(0),
                                                                send_conns: AtomicUsize::new(0),
-                                                               send_channel: None})
+                                                               send_errors: AtomicUsize::new(0),
+                                                               recv_errors: AtomicUsize::new(0),
+                                                               connect_errors: AtomicUsize::new(0),
+                                                               send_channel: None,
+                                                               availability: Availability::Up})
                         .recv_conns.fetch_add(1, Ordering::Relaxed);
                 }
                 
-                recv_handler_loop(node_state.clone(), u, stream, sender);
+                recv_handler_loop(node_state.clone(), &u, stream, sender);
                 
                 {
                     let peers = node_state.peers.lock().unwrap();
@@ -418,7 +474,11 @@ fn send_handler(node_state: Arc<node::NodeState>,
                 let ps = peers.entry(u).or_insert_with(|| PeerState{uuid: u,
                                                                     recv_conns: AtomicUsize::new(0),
                                                                     send_conns: AtomicUsize::new(0),
-                                                                    send_channel: None});
+                                                                    send_errors: AtomicUsize::new(0),
+                                                                    recv_errors: AtomicUsize::new(0),
+                                                                    connect_errors: AtomicUsize::new(0),
+                                                                    send_channel: None,
+                                                                    availability: Availability::Up});
                 ps.send_conns.fetch_add(1, Ordering::Relaxed);
                 ps.send_channel = Some(tx);
             }
@@ -429,7 +489,7 @@ fn send_handler(node_state: Arc<node::NodeState>,
             
             handshake.send(()).unwrap();
             
-            send_handler_loop(node_state.clone(), stream, rx);
+            send_handler_loop(node_state.clone(), &u, stream, rx);
             
             {
                 let peers = node_state.peers.lock().unwrap();
@@ -489,20 +549,23 @@ fn listener(node_state: Arc<node::NodeState>, addr: String,
 
 /// Connect to the given address, using the context to establish a TLS
 /// connection.  Call the handler function when connected.
-fn connect_to_node(node_state: Arc<node::NodeState>, addr: &String) {
+fn connect_to_node(node_state: Arc<node::NodeState>, addr: &String) -> bool {
     match TcpStream::connect(addr.as_str()) {
         Err(e) => {
             error!("cannot connect to {}: {}", addr, e);
+            false
         },
         Ok(stream) => {
             match ssl::Ssl::new(&node_state.ssl_context) {
                 Err(e) => {
                     error!("cannot create ssl context: {}", e);
+                    false
                 },
                 Ok(ssl) => {
                     match ssl::SslStream::connect(ssl, stream) {
                         Err(e) => {
                             error!("cannot establish ssl connection: {}", e);
+                            false
                         },
                         Ok(mut ssl_stream) => {
                             let (handshake_tx, handshake_rx) = sync_channel(0);
@@ -510,6 +573,7 @@ fn connect_to_node(node_state: Arc<node::NodeState>, addr: &String) {
                                 send_handler(node_state, &mut ssl_stream, handshake_tx);
                             });
                             let () = handshake_rx.recv().unwrap();
+                            true
                         }
                     }
                 }
@@ -536,6 +600,49 @@ fn connect_seeds(node_state: Arc<node::NodeState>) {
     }
 }
 
+fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
+                      handler: Handler,
+                      receiver: Receiver<message::Message>)
+    where Handler: Fn(message::Message) -> () + Send + 'static
+{
+    let self_uuid = node_state.config.uuid;
+    loop {
+        let d = receiver.recv().unwrap();
+        match d {
+            message::Message::Hello(u, addrs) => {
+                info!("received hello from {}: {:?}", u, addrs);
+                match node_state.address_map.lock() {
+                    Ok(mut addr_map) => {
+                        addr_map.insert(u, addrs);
+                    }
+                    Err(_) => {
+                        error!("cannot lock address map");
+                    }
+                };
+            },
+            message::Message::Ping(u) => {
+                let ns = node_state.clone();
+                send_message(ns, &u, message::Message::Pong(self_uuid));
+            },
+            message::Message::Pong(_u) => {
+                // Do nothing for now.
+            },
+            message::Message::Nodes(uuids) => {
+                info!("received node list: {:?}", uuids);
+                {
+                    let mut addr_map = node_state.address_map.lock().unwrap();
+                    for (u, addr) in uuids {
+                        let _e = addr_map.entry(u).or_insert_with(|| vec![addr]);
+                    }
+                }
+            },
+            _ => {
+                handler(d);
+            }
+        }
+    }
+}
+
 /// Kick off the networking subsystem. Creates listener threads for
 /// all configured listener addresses and starts sending threads for
 /// all configured seeds.  Additional connections will be created when
@@ -552,25 +659,72 @@ pub fn start_networking<Handler>(node_state: Arc<node::NodeState>,
     start_listeners(node_state.clone(), sender);
     connect_seeds(node_state.clone());
 
+    let node_state_clone  = node_state.clone();
     thread::spawn(move || {
-        loop {
-            let d = receiver.recv().unwrap();
-            match d {
-                message::Message::Hello(u, addrs) => {
-                    info!("received hello from {}: {:?}", u, addrs);
-                    match node_state.address_map.lock() {
-                        Ok(mut addr_map) => {
-                            addr_map.insert(u, addrs);
+        msg_recv_loop(node_state.clone(), handler, receiver);
+    });
+    thread::spawn(move || {
+        chatter_loop(node_state_clone);
+    });
+}
+
+/// Return a list of all known UUIDs and whether the corresponding
+/// node is considered Up or Down.
+fn get_peer_uuids(node_state: Arc<NodeState>) -> Vec<(Uuid, Availability)> {
+    let mut ret = Vec::new();
+    let peers = node_state.peers.lock().unwrap();
+    for (u, p) in peers.iter() {
+        let av = p.availability;
+        ret.push((u.clone(), av));
+    }
+    ret
+}
+
+/// Return a list of all known UUIDs plus listen address.
+fn get_peer_uuids_and_addresses(node_state: Arc<NodeState>, self_uuid: &Uuid) -> Vec<(Uuid, String)> {
+    let mut ret = Vec::new();
+    let peers = node_state.address_map.lock().unwrap();
+    for (u, p) in peers.iter() {
+        if *u != *self_uuid && p.len() > 0 {
+            ret.push((u.clone(), p[0].clone()));
+        }
+    }
+    ret
+}
+
+/// 
+fn chatter_loop(node_state: Arc<NodeState>) {
+    const ITERATION_SLEEP_MS: u64 = 2000;
+    let mut rng = rand::thread_rng();
+
+    let self_uuid = node_state.config.uuid;
+    loop {
+        thread::sleep(time::Duration::from_millis(ITERATION_SLEEP_MS));
+        {
+            let peers = get_peer_uuids(node_state.clone());
+            for &(u, av) in &peers {
+                match av {
+                    Availability::Up => {
+                        if rng.gen::<u8>() % 10 == 1 {
+                            let uuids = get_peer_uuids_and_addresses(node_state.clone(), &self_uuid);
+                            send_message(node_state.clone(), &u, message::Message::Nodes(uuids))
+                        } else {
+                            send_message(node_state.clone(), &u, message::Message::Ping(self_uuid))
                         }
-                        Err(_) => {
-                            error!("cannot lock address map");
+                    },
+                    Availability::Down => {
+                        if rng.gen::<u8>() % 10 == 3 {
+                            send_message(node_state.clone(), &u, message::Message::Ping(self_uuid))
                         }
-                    };
-                },
-                _ => {
-                    handler(d);
+                    }
                 }
             }
-        }
-    });
+            let uuids = get_peer_uuids_and_addresses(node_state.clone(), &self_uuid);
+            for &(u, _) in &uuids {
+                if rng.gen::<u8>() % 10 == 3 {
+                    send_message(node_state.clone(), &u, message::Message::Ping(self_uuid))
+                }
+            }
+        }            
+    }
 }

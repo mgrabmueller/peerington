@@ -9,9 +9,9 @@ extern crate getopts;
 extern crate openssl;
 extern crate byteorder;
 extern crate toml;
+extern crate rand;
 
 pub mod error;
 pub mod config;
 pub mod node;
 pub mod message;
-

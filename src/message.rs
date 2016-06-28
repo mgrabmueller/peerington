@@ -20,6 +20,9 @@ pub enum Message {
     /// may be sent again during the lifetime of a connection.
     Hello(Uuid, Vec<String>),
     Broadcast(String),
+    Ping(Uuid),
+    Pong(Uuid),
+    Nodes(Vec<(Uuid, String)>),
 }
 
 impl Message {
@@ -47,6 +50,33 @@ impl Message {
                 try!(r.read_exact(&mut v));
                 let msg = try!(String::from_utf8(v));
                 Ok(Message::Broadcast(msg))
+            },
+            30 => {
+                let mut buf = [0; 16];
+                try!(r.read_exact(&mut buf));
+                let uuid = try!(Uuid::from_bytes(&buf));
+                Ok(Message::Ping(uuid))
+            },
+            40 => {
+                let mut buf = [0; 16];
+                try!(r.read_exact(&mut buf));
+                let uuid = try!(Uuid::from_bytes(&buf));
+                Ok(Message::Pong(uuid))
+            },
+            50 => {
+                let uuid_count = try!(r.read_u16::<BigEndian>());
+                let mut uuids = Vec::new();
+                for _ in 0..uuid_count {
+                    let mut buf = [0; 16];
+                    try!(r.read_exact(&mut buf));
+                    let uuid = try!(Uuid::from_bytes(&buf));
+                    let addr_len = try!(r.read_u16::<BigEndian>());
+                    let mut v = vec![0; addr_len as usize];
+                    try!(r.read_exact(&mut v));
+                    let addr = try!(String::from_utf8(v));
+                    uuids.push((uuid, addr));
+                }
+                Ok(Message::Nodes(uuids))
             },
             _ => {
                 Err(error::Error::MessageParse("invalid message tag"))
@@ -76,7 +106,34 @@ impl Message {
                 try!(w.write_u16::<BigEndian>(msg.len() as u16));
                 try!(w.write(msg.as_bytes()));
                 Ok(())
-            }
+            },
+            Message::Ping(uuid) => {
+                try!(w.write_u8(30));
+                let buf = uuid.as_bytes();
+                try!(w.write(buf));
+                Ok(())
+            },
+            Message::Pong(uuid) => {
+                try!(w.write_u8(30));
+                let buf = uuid.as_bytes();
+                try!(w.write(buf));
+                Ok(())
+            },
+            Message::Nodes(ref uuids) => {
+                try!(w.write_u8(50));
+
+                assert!(uuids.len() <= (u16::MAX as usize));
+                try!(w.write_u16::<BigEndian>(uuids.len() as u16));
+                for i in 0..uuids.len() {
+                    let (ref uuid, ref addr) = uuids[i];
+                    let buf = uuid.as_bytes();
+                    try!(w.write(buf));
+                    assert!(addr.len() <= (u16::MAX as usize));
+                    try!(w.write_u16::<BigEndian>(addr.len() as u16));
+                    try!(w.write(addr.as_bytes()));
+                }
+                Ok(())
+            },
         }
     }
 }

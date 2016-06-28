@@ -236,11 +236,15 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         Command::Peers => {
             match node_state.peers.lock() {
                 Ok(peers) => {
-                    println!("uuid                               rcv snd");
+                    println!("uuid                                   rcv   snd    re    se    ce state");
                     for (name, peer_state) in &*peers {
-                        println!("{} {} {}", name,
+                        println!("{} {:5} {:5} {:5} {:5} {:5} {:5?}", name,
                                  peer_state.recv_conns.load(Ordering::Relaxed),
-                                 peer_state.send_conns.load(Ordering::Relaxed)
+                                 peer_state.send_conns.load(Ordering::Relaxed),
+                                 peer_state.recv_errors.load(Ordering::Relaxed),
+                                 peer_state.send_errors.load(Ordering::Relaxed),
+                                 peer_state.connect_errors.load(Ordering::Relaxed),
+                                 peer_state.availability,
                         );
                     }
                     ()
