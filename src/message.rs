@@ -23,6 +23,8 @@ pub enum Message {
     Ping(Uuid),
     Pong(Uuid),
     Nodes(Vec<(Uuid, String)>),
+    Election(Uuid),
+    Elected(Uuid),
 }
 
 impl Message {
@@ -78,6 +80,18 @@ impl Message {
                 }
                 Ok(Message::Nodes(uuids))
             },
+            60 => {
+                let mut buf = [0; 16];
+                try!(r.read_exact(&mut buf));
+                let uuid = try!(Uuid::from_bytes(&buf));
+                Ok(Message::Election(uuid))
+            },
+            61 => {
+                let mut buf = [0; 16];
+                try!(r.read_exact(&mut buf));
+                let uuid = try!(Uuid::from_bytes(&buf));
+                Ok(Message::Elected(uuid))
+            },
             _ => {
                 Err(error::Error::MessageParse("invalid message tag"))
             }
@@ -114,7 +128,7 @@ impl Message {
                 Ok(())
             },
             Message::Pong(uuid) => {
-                try!(w.write_u8(30));
+                try!(w.write_u8(40));
                 let buf = uuid.as_bytes();
                 try!(w.write(buf));
                 Ok(())
@@ -132,6 +146,20 @@ impl Message {
                     try!(w.write_u16::<BigEndian>(addr.len() as u16));
                     try!(w.write(addr.as_bytes()));
                 }
+                Ok(())
+            },
+            Message::Election(uuid) => {
+                try!(w.write_u8(60));
+
+                let buf = uuid.as_bytes();
+                try!(w.write(buf));
+                Ok(())
+            },
+            Message::Elected(uuid) => {
+                try!(w.write_u8(61));
+
+                let buf = uuid.as_bytes();
+                try!(w.write(buf));
                 Ok(())
             },
         }

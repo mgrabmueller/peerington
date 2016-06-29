@@ -52,11 +52,18 @@ pub struct PeerState {
     pub availability: Availability,
 }
 
+pub enum ElectionState {
+    NonParticipant,
+    Participant,
+    Elected,
+}
+
 pub struct NodeState {
     pub config: Arc<config::Config>,
     pub ssl_context: ssl::SslContext,
     pub address_map: Arc<Mutex<BTreeMap<Uuid, Vec<String>>>>,
     pub peers: Arc<Mutex<BTreeMap<Uuid, PeerState>>>,
+    pub election_state: Mutex<ElectionState>,
 }
 
 impl NodeState {
@@ -98,6 +105,7 @@ impl NodeState {
             ssl_context: ssl_context,
             address_map: Arc::new(Mutex::new(addr_map)),
             peers: Arc::new(Mutex::new(peers)),
+            election_state: Mutex::new(ElectionState::NonParticipant),
         })
     }
 }
@@ -233,6 +241,7 @@ fn verify_client_cert(preverify_ok: bool, x509_ctx: &x509::X509StoreContext) -> 
 pub fn send_message(node_state: Arc<node::NodeState>,
                     to: &Uuid,
                     message: message::Message) {
+//    trace!("sending to {}: {:?}", to, message);
     let tx = node::find_send_channel(node_state.clone(), to);
     match tx {
         Some(tx) => {
@@ -550,6 +559,7 @@ fn listener(node_state: Arc<node::NodeState>, addr: String,
 /// Connect to the given address, using the context to establish a TLS
 /// connection.  Call the handler function when connected.
 fn connect_to_node(node_state: Arc<node::NodeState>, addr: &String) -> bool {
+    trace!("connecting to {}", addr);
     match TcpStream::connect(addr.as_str()) {
         Err(e) => {
             error!("cannot connect to {}: {}", addr, e);
@@ -608,6 +618,7 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
     let self_uuid = node_state.config.uuid;
     loop {
         let d = receiver.recv().unwrap();
+//        trace!("msg_recv_loop: {:?}", d);
         match d {
             message::Message::Hello(u, addrs) => {
                 info!("received hello from {}: {:?}", u, addrs);
@@ -628,11 +639,13 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                 // Do nothing for now.
             },
             message::Message::Nodes(uuids) => {
-                info!("received node list: {:?}", uuids);
+//                info!("received node list: {:?}", uuids);
                 {
                     let mut addr_map = node_state.address_map.lock().unwrap();
                     for (u, addr) in uuids {
-                        let _e = addr_map.entry(u).or_insert_with(|| vec![addr]);
+                        if u != self_uuid {
+                            let _e = addr_map.entry(u).or_insert_with(|| vec![addr]);
+                        }
                     }
                 }
             },
@@ -668,24 +681,12 @@ pub fn start_networking<Handler>(node_state: Arc<node::NodeState>,
     });
 }
 
-/// Return a list of all known UUIDs and whether the corresponding
-/// node is considered Up or Down.
-fn get_peer_uuids(node_state: Arc<NodeState>) -> Vec<(Uuid, Availability)> {
-    let mut ret = Vec::new();
-    let peers = node_state.peers.lock().unwrap();
-    for (u, p) in peers.iter() {
-        let av = p.availability;
-        ret.push((u.clone(), av));
-    }
-    ret
-}
-
 /// Return a list of all known UUIDs plus listen address.
-fn get_peer_uuids_and_addresses(node_state: Arc<NodeState>, self_uuid: &Uuid) -> Vec<(Uuid, String)> {
+fn get_peer_uuids_and_addresses(node_state: Arc<NodeState>) -> Vec<(Uuid, String)> {
     let mut ret = Vec::new();
     let peers = node_state.address_map.lock().unwrap();
     for (u, p) in peers.iter() {
-        if *u != *self_uuid && p.len() > 0 {
+        if p.len() > 0 {
             ret.push((u.clone(), p[0].clone()));
         }
     }
@@ -699,30 +700,47 @@ fn chatter_loop(node_state: Arc<NodeState>) {
 
     let self_uuid = node_state.config.uuid;
     loop {
+//        trace!("chatter_loop");
         thread::sleep(time::Duration::from_millis(ITERATION_SLEEP_MS));
         {
-            let peers = get_peer_uuids(node_state.clone());
-            for &(u, av) in &peers {
-                match av {
-                    Availability::Up => {
-                        if rng.gen::<u8>() % 10 == 1 {
-                            let uuids = get_peer_uuids_and_addresses(node_state.clone(), &self_uuid);
-                            send_message(node_state.clone(), &u, message::Message::Nodes(uuids))
-                        } else {
-                            send_message(node_state.clone(), &u, message::Message::Ping(self_uuid))
-                        }
-                    },
-                    Availability::Down => {
-                        if rng.gen::<u8>() % 10 == 3 {
-                            send_message(node_state.clone(), &u, message::Message::Ping(self_uuid))
+            let uuids = get_peer_uuids_and_addresses(node_state.clone());
+            for &(u, _) in &uuids {
+                {
+//                    trace!("considering {}", u);
+                    let availability = {
+                        let peers = node_state.peers.lock().unwrap();
+                        peers.get(&u).map(|peer| peer.availability)
+                    };
+                    match availability {
+                        None => {
+                            if rng.gen::<u8>() % 10 <= 5 {
+                                send_message(node_state.clone(), &u,
+                                             message::Message::Ping(self_uuid))
+                            }
+                        },
+                        Some(Availability::Up) => {
+                                if rng.gen::<u8>() % 10 <= 3 {
+                                let mut us: Vec<(Uuid, String)> = uuids.clone()
+                                    .into_iter()
+                                    .filter(|&(uu,_)| uu != u)
+                                    .collect();
+                                us.push((self_uuid,
+                                         node_state.config.listen_addresses[0].clone()));
+                                send_message(node_state.clone(), &u,
+                                             message::Message::Nodes(us))
+                            } else {
+                                send_message(node_state.clone(), &u,
+                                             message::Message::Ping(self_uuid))
+                            }
+                        },
+                        Some(Availability::Down) => {
+                            if rng.gen::<u8>() % 10 <= 5 {
+                                send_message(node_state.clone(), &u,
+                                             message::Message::Ping(self_uuid))
+                            }
                         }
                     }
-                }
-            }
-            let uuids = get_peer_uuids_and_addresses(node_state.clone(), &self_uuid);
-            for &(u, _) in &uuids {
-                if rng.gen::<u8>() % 10 == 3 {
-                    send_message(node_state.clone(), &u, message::Message::Ping(self_uuid))
+                    
                 }
             }
         }            
