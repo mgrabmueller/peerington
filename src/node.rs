@@ -4,11 +4,12 @@
 
 extern crate rand;
 
-use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
@@ -36,45 +37,104 @@ use super::config;
 use super::error;
 use super::node;
 
-#[derive(Debug, Clone, Copy)]
+/// Defines whether a node is considered up (available) or down
+/// (unavailable).  A node is marked as down when it is not possible
+/// to connect to the node's listen address.  Note that availability
+/// can only be a guess, since failures can happen at any time in a
+/// distributed network and it might take a while to detect it.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Availability {
+    /// Node is available right now.
     Up,
+
+    /// Node is not available right now.
     Down,
 }
 
+/// Records information about a node that was connected at least once
+/// in the current run of the current node.
 pub struct PeerState {
+    /// UUID of the peer.
     pub uuid: Uuid,
+
+    /// Number of active receive connections.
     pub recv_conns: AtomicUsize,
+
+    /// Number of active send connections.
     pub send_conns: AtomicUsize,
+
+    /// Internal channel for sending messages to the node.
     pub send_channel: Option<SyncSender<message::Message>>,
+
+    /// Number of send errors that have been detected.
     pub send_errors: AtomicUsize,
+
+    /// Number of receive errors that have been detected.
     pub recv_errors: AtomicUsize,
+
+    /// Number of connection errors that have been detected.
     pub connect_errors: AtomicUsize,
+
+    /// Currently known availability of the node.
     pub availability: Availability,
 }
 
+/// Whether the current node currently participates in an election
+/// (`Participant`) or not (`NonParticipant`).
 #[derive(Clone, Copy, Debug)]
 pub enum ElectionState {
+    /// Not participating in an election right now.
     NonParticipant,
+
+    /// Participating in an election.
     Participant,
 }
 
+/// Current knowledge about cluster leadership (or coordinator).  All
+/// nodes start with `LeaderUnknown`, which will trigger a leader
+/// election.  The state is set to `LeaderUnknown` whenever the
+/// current leader is recognized as `Down` or when an election message
+/// is received.
 #[derive(Clone, Copy, Debug)]
 pub enum Leadership {
+    /// Nothing known about cluster leadership.
     LeaderUnknown,
+
+    /// Leader is known and has the given UUID. Invariant: the UUID
+    /// can never be the one of the current node.
     LeaderKnown(Uuid),
+
+    /// The current node is the leader.
     SelfLeader,
 }
 
+/// State of the current node.
 pub struct NodeState {
+    /// Node configuration.
     pub config: Arc<config::Config>,
+
+    /// Context for establishing TLS connections. Contains
+    /// certificates, keys, TLS settings etc.
     pub ssl_context: ssl::SslContext,
-    pub address_map: Arc<Mutex<BTreeMap<Uuid, Vec<String>>>>,
-    pub peers: Arc<Mutex<BTreeMap<Uuid, PeerState>>>,
-    pub election_state: Mutex<Cell<(Leadership, ElectionState)>>,
+
+    /// Map from UUIDs to listening addresses of other nodes.  These
+    /// are learned from command line options, configuration files,
+    /// when connections are established and when messages containing
+    /// this information are received.  Note that there are not
+    /// necessarily active connections to any of these nodes at any
+    /// given time.
+    pub address_map: RwLock<BTreeMap<Uuid, HashSet<String>>>,
+
+    /// Detailed information about peers that have been connected at
+    /// least once since the current run of the current node.
+    pub peers: Mutex<BTreeMap<Uuid, PeerState>>,
+
+    /// State about ongoing leadership exceptions.
+    pub election_state: RwLock<(Leadership, ElectionState)>,
 }
 
 impl NodeState {
+    /// Create a new node state based on the given configuration.
     pub fn new(config: Arc<config::Config>) -> Result<NodeState, error::Error> {
         let mut ssl_context = try!(ssl::SslContext::new(ssl::SslMethod::Tlsv1));
 
@@ -111,35 +171,34 @@ impl NodeState {
         Ok(NodeState {
             config: config,
             ssl_context: ssl_context,
-            address_map: Arc::new(Mutex::new(addr_map)),
-            peers: Arc::new(Mutex::new(peers)),
-            election_state: Mutex::new(Cell::new((Leadership::LeaderUnknown,
-                                                  ElectionState::NonParticipant))),
+            address_map: RwLock::new(addr_map),
+            peers: Mutex::new(peers),
+            election_state: RwLock::new((Leadership::LeaderUnknown,
+                                         ElectionState::NonParticipant)),
         })
     }
 }
 
+/// Find the listen addresses of the node with the given UUID.
 pub fn find_addrs(node_state: Arc<NodeState>,
-                  to: &Uuid) -> Option<Vec<String>> {
-    trace!(">find_addrs");
-    match node_state.address_map.lock() {
+                  to: &Uuid) -> Option<HashSet<String>> {
+    match node_state.address_map.read() {
         Ok(addr_map) => {
             if let Some(addrs) = addr_map.get(&to) {
-                trace!("<find_addrs");
                 Some(addrs.clone())
             } else {
-                trace!("<find_addrs");
                 None
                 }
         }
         Err(_) => {
             error!("cannot lock node map");
-            trace!("<find_addrs");
             None
         }
     }
 }
 
+/// Delete the send channel for the node with the given UUID. This is
+/// necessary when a send connection is disconnected.
 pub fn remove_send_channel(node_state: Arc<node::NodeState>,
                            to: &Uuid) {
     let mut peers = node_state.peers.lock().unwrap();
@@ -153,8 +212,10 @@ pub fn remove_send_channel(node_state: Arc<node::NodeState>,
     }
 }
 
+/// Get the current active send channel for the node with the given
+/// UUID.
 pub fn find_send_channel(node_state: Arc<node::NodeState>,
-               to: &Uuid) -> Option<SyncSender<message::Message>> {
+                         to: &Uuid) -> Option<SyncSender<message::Message>> {
     let peers = node_state.peers.lock().unwrap();
     if let Some(ps) = peers.get(&to) {
         match ps.send_channel {
@@ -164,21 +225,11 @@ pub fn find_send_channel(node_state: Arc<node::NodeState>,
     } else {
         None
     }
-    // match node_state.connected_nodes_send.lock() {
-    //     Ok(connected_nodes) => {
-    //         if let Some(ni) = connected_nodes.get(&to) {
-    //             Some(ni.tx.clone())
-    //         } else {
-    //             None
-    //             }
-    //     }
-    //     Err(_) => {
-    //         error!("cannot lock node map");
-    //             None
-    //     }
-    // }
 }
 
+/// TLS client certificate verification hook.  Just returns true if
+/// OpenSSL's verification succeeded, otherwise try to print a useful
+/// error message.
 fn verify_client_cert(preverify_ok: bool, x509_ctx: &x509::X509StoreContext) -> bool {
     if preverify_ok {
          return true;
@@ -251,6 +302,7 @@ fn verify_client_cert(preverify_ok: bool, x509_ctx: &x509::X509StoreContext) -> 
     }
 }
 
+/// Attempt to send a message to the node with the given UUID.
 pub fn send_message(node_state: Arc<node::NodeState>,
                     to: &Uuid,
                     message: message::Message) {
@@ -270,8 +322,7 @@ pub fn send_message(node_state: Arc<node::NodeState>,
         None => {
             match node::find_addrs(node_state.clone(), to) {
                 Some(addrs) => {
-                    if addrs.len() > 0 {
-                        let addr = &addrs[0];
+                    if let Some(ref addr) = addrs.iter().next() {
                         let connected = connect_to_node(node_state.clone(), addr);
                         if connected {
                             {
@@ -314,10 +365,13 @@ pub fn send_message(node_state: Arc<node::NodeState>,
     }
 }
 
-
-fn recv_handler_loop(node_state: Arc<node::NodeState>, uuid: &Uuid,
-                     stream: &mut ssl::SslStream<TcpStream>, sender: SyncSender<message::Message>) {
-    let mut buf = [33; 1024];
+/// Loop reading data from a connected node, decoding messages and
+/// forwarding them to the given channel.
+fn recv_handler_loop(node_state: Arc<node::NodeState>,
+                     uuid: &Uuid,
+                     stream: &mut ssl::SslStream<TcpStream>,
+                     sender: SyncSender<message::Message>) {
+    let mut buf = [0; 1024];
     let mut msg = Vec::new();
     loop {
         match stream.ssl_read(&mut buf) {
@@ -438,34 +492,43 @@ fn get_peer_uuid(stream: &ssl::SslStream<TcpStream>) -> Option<Uuid> {
 fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<TcpStream>,
                 sender: SyncSender<message::Message>) {
     if let Ok(peer) = stream.get_ref().peer_addr() {
-        info!("connected to {}", peer);
+//        info!("connected to {}", peer);
         match get_peer_uuid(stream) {
             Some(u) => {
-                info!("UUID of peer: {}", u);
+//                info!("UUID of peer: {}", u);
 
-                // When a previously unknown peer UUID is
-                // encountered, we forget our current leader
-                // so that a new election will take place.
-                if !is_known_uuid(node_state.clone(), &u) {
-                    trace!("connected by unknown UUID, forgetting leader");
-                    forget_leader(node_state.clone());
+                // When a previously unknown peer UUID is encountered
+                // that might become a new leader, we forget our
+                // current leader so that a new election will take
+                // place.
+                if let Some(cur_leader) = current_leader(node_state.clone()) {
+                    if !is_known_uuid(node_state.clone(), &u) && u > cur_leader {
+                        trace!("connected by unknown UUID, forgetting leader");
+                        forget_leader(node_state.clone());
+                    }
                 }
 
                 {
                     let mut peers = node_state.peers.lock().unwrap();
-                    peers.entry(u).or_insert_with(|| PeerState{uuid: u,
-                                                               recv_conns: AtomicUsize::new(0),
-                                                               send_conns: AtomicUsize::new(0),
-                                                               send_errors: AtomicUsize::new(0),
-                                                               recv_errors: AtomicUsize::new(0),
-                                                               connect_errors: AtomicUsize::new(0),
-                                                               send_channel: None,
-                                                               availability: Availability::Up})
+                    peers.entry(u)
+                        .or_insert_with(|| PeerState{uuid: u,
+                                                     recv_conns: AtomicUsize::new(0),
+                                                     send_conns: AtomicUsize::new(0),
+                                                     send_errors: AtomicUsize::new(0),
+                                                     recv_errors: AtomicUsize::new(0),
+                                                     connect_errors: AtomicUsize::new(0),
+                                                     send_channel: None,
+                                                     availability: Availability::Up})
                         .recv_conns.fetch_add(1, Ordering::Relaxed);
                 }
 
                 recv_handler_loop(node_state.clone(), &u, stream, sender);
 
+                if let Some(cur_leader) = current_leader(node_state.clone()) {
+                    if cur_leader == u {
+                        forget_leader(node_state.clone());
+                    }
+                }
                 {
                     let peers = node_state.peers.lock().unwrap();
                     peers.get(&u).unwrap().recv_conns.fetch_sub(1, Ordering::Relaxed);
@@ -487,21 +550,24 @@ fn send_handler(node_state: Arc<node::NodeState>,
                 stream: &mut ssl::SslStream<TcpStream>,
                 handshake: SyncSender<()>) {
     let peer = stream.get_ref().peer_addr().unwrap();
-    info!("connected to {}", peer);
+//    info!("connected to {}", peer);
     match get_peer_uuid(stream) {
         None => {
             error!("cannot determine peer UUID");
         },
         Some(u) => {
             let (tx, rx) = sync_channel(100);
-            info!("UUID of peer: {}", u);
+//            info!("UUID of peer: {}", u);
 
-            // When a previously unknown peer UUID is
-            // encountered, we forget our current leader
-            // so that a new election will take place.
-            if !is_known_uuid(node_state.clone(), &u) {
-                trace!("connecting to unknown UUID, forgetting leader");
-                forget_leader(node_state.clone());
+            // When a previously unknown peer UUID is encountered
+            // that might become a new leader, we forget our
+            // current leader so that a new election will take
+            // place.
+            if let Some(cur_leader) = current_leader(node_state.clone()) {
+                if !is_known_uuid(node_state.clone(), &u) && u > cur_leader {
+                    trace!("connecting to unknown UUID, forgetting leader");
+                    forget_leader(node_state.clone());
+                }
             }
 
             // Make sure the send_handler_loop receives the Hello
@@ -509,33 +575,39 @@ fn send_handler(node_state: Arc<node::NodeState>,
             // before entering the sending part of the channel into
             // the global map.
             tx.send(message::Message::Hello(node_state.config.uuid,
-                                            node_state.config.listen_addresses.clone())).unwrap();
+                                            node_state.config
+                                            .listen_addresses.clone())).unwrap();
 
 
             {
                 let mut peers = node_state.peers.lock().unwrap();
-                let ps = peers.entry(u).or_insert_with(|| PeerState{uuid: u,
-                                                                    recv_conns: AtomicUsize::new(0),
-                                                                    send_conns: AtomicUsize::new(0),
-                                                                    send_errors: AtomicUsize::new(0),
-                                                                    recv_errors: AtomicUsize::new(0),
-                                                                    connect_errors: AtomicUsize::new(0),
-                                                                    send_channel: None,
-                                                                    availability: Availability::Up});
+                let ps = peers.entry(u)
+                    .or_insert_with(|| PeerState{uuid: u,
+                                                 recv_conns: AtomicUsize::new(0),
+                                                 send_conns: AtomicUsize::new(0),
+                                                 send_errors: AtomicUsize::new(0),
+                                                 recv_errors: AtomicUsize::new(0),
+                                                 connect_errors: AtomicUsize::new(0),
+                                                 send_channel: None,
+                                                 availability: Availability::Up});
                 ps.send_conns.fetch_add(1, Ordering::Relaxed);
                 ps.send_channel = Some(tx);
             }
             {
-                trace!(">send_handler");
-                let mut addr_map = node_state.address_map.lock().unwrap();
-                addr_map.entry(u).or_insert(vec![]).push(peer.to_string());
-                trace!("<send_handler");
+                let mut addr_map = node_state.address_map.write().unwrap();
+                addr_map.entry(u)
+                    .or_insert_with(|| HashSet::new()).insert(peer.to_string());
             }
 
             handshake.send(()).unwrap();
 
             send_handler_loop(node_state.clone(), &u, stream, rx);
 
+            if let Some(cur_leader) = current_leader(node_state.clone()) {
+                if cur_leader == u {
+                    forget_leader(node_state.clone());
+                }
+            }
             {
                 let peers = node_state.peers.lock().unwrap();
                 peers.get(&u).unwrap().send_conns.fetch_sub(1, Ordering::Relaxed);
@@ -628,8 +700,9 @@ fn connect_to_node(node_state: Arc<node::NodeState>, addr: &String) -> bool {
     }
 }
 
+/// Start the listening threads for all configured listen addresses.
 fn start_listeners(node_state: Arc<node::NodeState>,
-                       sender: SyncSender<message::Message>) {
+                   sender: SyncSender<message::Message>) {
     for addr in node_state.config.listen_addresses.clone() {
         let a = addr.clone();
         let ns = node_state.clone();
@@ -638,6 +711,7 @@ fn start_listeners(node_state: Arc<node::NodeState>,
     }
 }
 
+/// Attempt connections to all configured seed node listen addresses.
 fn connect_seeds(node_state: Arc<node::NodeState>) {
     for addr in node_state.config.seed_addresses.clone() {
         let a = addr.clone();
@@ -646,9 +720,12 @@ fn connect_seeds(node_state: Arc<node::NodeState>) {
     }
 }
 
+/// All incoming messages are handled in this loop. Messages for
+/// cluster and peer handling are handled directly by modifying the
+/// node states, other messages are passed to the given handler.
 fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
-                      handler: Handler,
-                      receiver: Receiver<message::Message>)
+                          handler: Handler,
+                          receiver: Receiver<message::Message>)
     where Handler: Fn(message::Message) -> () + Send + 'static
 {
     let self_uuid = node_state.config.uuid;
@@ -658,16 +735,17 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
         match d {
             message::Message::Hello(u, addrs) => {
                 info!("received hello from {}: {:?}", u, addrs);
-                trace!(">msg_recv_loop");
-                match node_state.address_map.lock() {
+                match node_state.address_map.write() {
                     Ok(mut addr_map) => {
-                        addr_map.insert(u, addrs);
+                        for a in addrs {
+                            addr_map.entry(u).or_insert_with(|| HashSet::new())
+                                .insert(a);
+                        }
                     }
                     Err(_) => {
                         error!("cannot lock address map");
                     }
                 };
-                trace!("<msg_recv_loop");
             },
             message::Message::Ping(u) => {
                 let ns = node_state.clone();
@@ -679,76 +757,97 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
             message::Message::Nodes(uuids) => {
 //                info!("received node list: {:?}", uuids);
                 {
-                    trace!("<msg_recv_loop2");
-                    let mut addr_map = node_state.address_map.lock().unwrap();
+                    let known_uuids = get_known_uuids(node_state.clone());
+                    let cur_leader_mb = current_leader(node_state.clone());
+                    
+                    let mut addr_map = node_state.address_map.write().unwrap();
                     for (u, addr) in uuids {
                         if u != self_uuid {
-                            let _e = addr_map.entry(u).or_insert_with(|| vec![addr]);
+                            addr_map.entry(u).or_insert_with(|| HashSet::new())
+                                    .insert(addr);
                         }
 
-                        // When a previously unknown peer UUID is
-                        // encountered, we forget our current leader
-                        // so that a new election will take place.
-                        if !is_known_uuid(node_state.clone(), &u) {
-                            trace!("got told about unknown UUID, forgetting leader");
-                            forget_leader(node_state.clone());
+                        // When a previously unknown peer UUID is encountered
+                        // that might become a new leader, we forget our
+                        // current leader so that a new election will take
+                        // place.
+                        if let Some(cur_leader) = cur_leader_mb {
+                            if !known_uuids.contains(&u) && u > cur_leader {
+                                trace!("got told about unknown UUID, forgetting leader");
+                                forget_leader(node_state.clone());
+                            }
                         }
                     }
-                    trace!(">msg_recv_loop2");
                 }
             },
+
             message::Message::Election(proposed_uuid) => {
+                trace!("rcvd Election({})", proposed_uuid);
                 let (_leadership, election_state) = get_election_state(node_state.clone());
-                if let Some(next_uuid) = get_next_uuid(node_state.clone(), &self_uuid) {
+                if let Some(next_uuid) = get_next_uuid(node_state.clone(),
+                                                       &self_uuid) {
                     if proposed_uuid > self_uuid {
+                        trace!("forwarding election to {}, proposed UUID greater than mine",
+                               next_uuid);
                         send_message(node_state.clone(), &next_uuid,
                                      message::Message::Election(proposed_uuid));
-                        set_election_state(node_state.clone(), Leadership::LeaderUnknown, ElectionState::Participant);
+                        set_election_state(node_state.clone(),
+                                           Leadership::LeaderUnknown,
+                                           ElectionState::Participant);
                     } else if proposed_uuid < self_uuid {
                         match election_state {
                             ElectionState::NonParticipant => {
-                                trace!("forwarding election msg for {} to {} (proposed: {}), becoming participant",
-                                       self_uuid, next_uuid, proposed_uuid);
+                                trace!("forwarding election to {}, proposed UUID {} smaller than mine", next_uuid, proposed_uuid);
+                                set_election_state(node_state.clone(),
+                                                   Leadership::LeaderUnknown,
+                                                   ElectionState::Participant);
                                 send_message(node_state.clone(), &next_uuid,
                                              message::Message::Election(self_uuid));
-                                set_election_state(node_state.clone(), Leadership::LeaderUnknown, ElectionState::Participant);
                             },
                             ElectionState::Participant => {
+                                trace!("already participant, dropping");
                             }
                         }
                     } else /* proposed_uuid == self_uuid */ {
                         match election_state {
                             ElectionState::NonParticipant => {
-                                error!("got election message with own UUID, but not participant");
+                                error!("got election message with own UUID, but not participant - dropping");
                             },
                             ElectionState::Participant => {
-                                trace!("got election msg for {} (myself={}), turning to leader",
-                                       proposed_uuid, self_uuid);
+                                trace!("got election msg for myself, turning to leader, sending Elected({}) to {}",
+                                       self_uuid, next_uuid);
                                 send_message(node_state.clone(), &next_uuid,
                                              message::Message::Elected(self_uuid));
-                                set_election_state(node_state.clone(), Leadership::LeaderUnknown,
+                                set_election_state(node_state.clone(),
+                                                   Leadership::LeaderUnknown,
                                                    ElectionState::NonParticipant);
                             }
                         }
                     }
+                } else {
+                    error!("cannot determine next node in ring");
                 }
             },
+
             message::Message::Elected(elected_uuid) => {
+                trace!("rcvd Elected({})", elected_uuid);
                 let (_leadership, _) = get_election_state(node_state.clone());
-                if let Some(next_uuid) = get_next_uuid(node_state.clone(), &self_uuid) {
+                if let Some(next_uuid) = get_next_uuid(node_state.clone(),
+                                                       &self_uuid) {
                     if self_uuid == elected_uuid {
-                        trace!("got elected msg for {} (myself), becoming leader",
-                               elected_uuid);
+                        trace!("got elected msg for myself, becoming leader, stopping election");
                         set_election_state(node_state.clone(), Leadership::SelfLeader,
                                            ElectionState::NonParticipant);
                     } else {
-                        trace!("got elected msg for {}, recording as leader",
-                               elected_uuid);
+                        trace!("got elected msg for other node, recording as leader");
+                        set_election_state(node_state.clone(),
+                                           Leadership::LeaderKnown(elected_uuid),
+                                           ElectionState::NonParticipant);
                         send_message(node_state.clone(), &next_uuid,
                                      message::Message::Elected(elected_uuid));
-                        set_election_state(node_state.clone(), Leadership::LeaderKnown(elected_uuid),
-                                           ElectionState::NonParticipant);
                     }
+                } else {
+                    error!("cannot determine next node in ring");
                 }
             },
             _ => {
@@ -783,52 +882,82 @@ pub fn start_networking<Handler>(node_state: Arc<node::NodeState>,
     });
 }
 
+fn peer_availability(node_state: Arc<NodeState>, uuid: &Uuid) -> Availability {
+    let peers = node_state.peers.lock().unwrap();
+    if let Some(peer) = peers.get(&uuid) {
+        peer.availability
+    } else {
+        Availability::Down
+    }
+}
+
 /// Return a list of all known UUIDs plus listen address.
-fn get_peer_uuids_and_addresses(node_state: Arc<NodeState>, caller: &str) -> Vec<(Uuid, String)> {
-    trace!(">get_peer_uuids_and_addresses {}", caller);
+fn get_peer_uuids_and_addresses(node_state: Arc<NodeState>) -> Vec<(Uuid, String)> {
     let mut ret = Vec::new();
     {
-        let peers = node_state.address_map.lock().unwrap();
+        let peers = node_state.address_map.read().unwrap();
         for (u, p) in peers.iter() {
-            if p.len() > 0 {
-                ret.push((u.clone(), p[0].clone()));
+            if let Some(pp) = p.iter().next() {
+                ret.push((u.clone(), pp.clone()));
             }
         }
     }
-    trace!("<get_peer_uuids_and_addresses {}", caller);
     ret
 }
 
 fn forget_leader(node_state: Arc<NodeState>) {
-    let es = node_state.election_state.lock().unwrap();
-    es.set((Leadership::LeaderUnknown, ElectionState::NonParticipant));
+    let mut es = node_state.election_state.write().unwrap();
+    *es = (Leadership::LeaderUnknown, ElectionState::NonParticipant);
+}
+
+pub fn current_leader(node_state: Arc<NodeState>) -> Option<Uuid> {
+    let es = node_state.election_state.read().unwrap();
+    match *es {
+        (Leadership::SelfLeader, _) => Some(node_state.config.uuid),
+        (Leadership::LeaderKnown(u), _) => Some(u),
+        (_, _) => None,
+    }
 }
 
 fn is_known_uuid(node_state: Arc<NodeState>, uuid: &Uuid) -> bool {
-    trace!(">is_known_uuid");
-    let peers = {
-        let p = node_state.address_map.lock().unwrap();
-        p
-    };
+    let peers = node_state.address_map.read().unwrap();
     for (u, _) in peers.iter() {
         if u == uuid {
-            trace!("<is_known_uuid");
             return true;
         }
     }
-            trace!(">is_known_uuid");
     return false;
 }
 
+fn get_known_uuids(node_state: Arc<NodeState>) -> HashSet<Uuid> {
+    let peers = node_state.address_map.read().unwrap();
+    let mut ret = HashSet::new();
+    for (u, _) in peers.iter() {
+        ret.insert(u.clone());
+    }
+    ret
+}
+
 /// Return the next UUID in the ring of all known UUIDs.
-fn get_next_uuid(node_state: Arc<NodeState>, from_uuid: &Uuid) -> Option<Uuid> {
-    let mut uuids = get_peer_uuids_and_addresses(node_state.clone(), "get_next_uuid");
+fn get_next_uuid(node_state: Arc<NodeState>,
+                 from_uuid: &Uuid) -> Option<Uuid> {
+    let mut uuids: Vec<_> = get_peer_uuids_and_addresses(node_state.clone())
+        .into_iter()
+        .map(|(u, _)| u)
+        .filter(|u| peer_availability(node_state.clone(), &u) == Availability::Up)
+        .collect();
+//    trace!("uuids: {:?}", uuids);
     if uuids.len() > 0 {
-        uuids.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
+//        uuids.push(*self_uuid);
+        uuids.sort_by(|&a, &b| a.cmp(&b));
+//        trace!("uuids: {:?}", uuids);
         let next_uuid =
-            match uuids.iter().take_while(|&&(a, _)| a < *from_uuid).next() {
-                None => &uuids[0].0,
-                Some(u) => &u.0,
+            match uuids
+            .iter()
+            .skip_while(|&&a| a < *from_uuid)
+            .next() {
+                None => &uuids[0],
+                Some(u) => &u,
             };
         Some(next_uuid.clone())
     } else {
@@ -836,17 +965,18 @@ fn get_next_uuid(node_state: Arc<NodeState>, from_uuid: &Uuid) -> Option<Uuid> {
     }
 }
 
-fn set_election_state(node_state: Arc<NodeState>, leadership: Leadership, election_state: ElectionState) {
-    let es = node_state.election_state.lock().unwrap();
-    es.set((leadership, election_state));
+fn set_election_state(node_state: Arc<NodeState>,
+                      leadership: Leadership,
+                      election_state: ElectionState) {
+    let mut es = node_state.election_state.write().unwrap();
+    *es = (leadership, election_state);
 }
 
-fn get_election_state(node_state: Arc<NodeState>) -> (Leadership, ElectionState) {
-    let es = node_state.election_state.lock().unwrap();
-    es.get()
+pub fn get_election_state(node_state: Arc<NodeState>) -> (Leadership, ElectionState) {
+    let es = node_state.election_state.read().unwrap();
+    *es
 }
 
-///
 fn chatter_loop(node_state: Arc<NodeState>) {
     const ITERATION_SLEEP_MS: u64 = 2000;
     let mut rng = rand::thread_rng();
@@ -855,25 +985,24 @@ fn chatter_loop(node_state: Arc<NodeState>) {
     
     let self_uuid = node_state.config.uuid;
     loop {
-        trace!("chatter loop");
         thread::sleep(time::Duration::from_millis(ITERATION_SLEEP_MS));
-        let mut uuids = get_peer_uuids_and_addresses(node_state.clone(), "chatter_loop");
-        trace!("retrieved {} uuids", uuids.len());
+        let mut uuids = get_peer_uuids_and_addresses(node_state.clone());
 
         if uuids.len() > 0 {
-            trace!("got me some uuids");
             let es = get_election_state(node_state.clone());
 
             match es {
                 (Leadership::LeaderUnknown, ElectionState::NonParticipant) => {
-                    if let Some(next_uuid) = get_next_uuid(node_state.clone(), &self_uuid) {
-                        trace!("leadership unknown, sending election for {} to {}",
+                    if let Some(next_uuid) = get_next_uuid(node_state.clone(),
+                                                           &self_uuid) {
+                        trace!("leadership unknown, sending Election({}) to {}",
                                self_uuid, next_uuid);
+                        trace!("peers: {:?}, next: {}", uuids, next_uuid);
                         send_message(node_state.clone(), &next_uuid,
                                      message::Message::Election(self_uuid));
-                        trace!("election message sent, setting election state");
-                        set_election_state(node_state.clone(), Leadership::LeaderUnknown, ElectionState::Participant);
-                        trace!("election state set");
+                        set_election_state(node_state.clone(),
+                                           Leadership::LeaderUnknown,
+                                           ElectionState::Participant);
                     }
                 },
                 (_, ElectionState::Participant) => {

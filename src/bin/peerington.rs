@@ -6,13 +6,19 @@ extern crate peerington;
 extern crate env_logger;
 extern crate uuid;
 
+use std::sync::atomic::AtomicUsize;
+
 use peerington::config::get_config;
 use peerington::config::print_usage;
 use peerington::error::ConfigError;
 use peerington::config::Config;
 use peerington::node::NodeState;
+use peerington::node::PeerState;
+use peerington::node::Availability;
 use peerington::node::start_networking;
 use peerington::node::send_message;
+use peerington::node::get_election_state;
+use peerington::node::current_leader;
 use peerington::message::Message;
 
 use uuid::Uuid;
@@ -203,7 +209,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
     match cmd {
         Command::Nodes => {
             println!("addresses:");
-            match node_state.address_map.lock() {
+            match node_state.address_map.read() {
                 Ok(addr_map) => {
                     for (name, addr) in &*addr_map {
                         println!("  {}: {:?}", name, addr);
@@ -236,9 +242,36 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         Command::Peers => {
             match node_state.peers.lock() {
                 Ok(peers) => {
-                    println!("uuid                                   rcv   snd    re    se    ce state");
+                    println!("uuid                                      rcv   snd    re    se    ce state");
+                    let self_peer_state =
+                        PeerState{uuid: node_state.config.uuid,
+                                  recv_conns: AtomicUsize::new(0),
+                                  send_conns: AtomicUsize::new(0),
+                                  send_errors: AtomicUsize::new(0),
+                                  recv_errors: AtomicUsize::new(0),
+                                  connect_errors: AtomicUsize::new(0),
+                                  send_channel: None,
+                                  availability: Availability::Up};
+                    let mut ps = Vec::new();
                     for (name, peer_state) in &*peers {
-                        println!("{} {:5} {:5} {:5} {:5} {:5} {:5?}", name,
+                        ps.push((name, peer_state));
+                    }
+
+                    ps.push((&node_state.config.uuid,
+                             &self_peer_state));
+                    ps.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
+
+                    for (name, peer_state) in ps {
+                        let marker1 = if *name == self_peer_state.uuid {
+                            "*" } else { " " };
+                        
+                        let marker2 = if Some(*name) == current_leader(node_state.clone()) {
+                            "L" } else { " " };
+                        
+                        println!("{}{} {} {:5} {:5} {:5} {:5} {:5} {:5?}",
+                                 marker1,
+                                 marker2,
+                                 name,
                                  peer_state.recv_conns.load(Ordering::Relaxed),
                                  peer_state.send_conns.load(Ordering::Relaxed),
                                  peer_state.recv_errors.load(Ordering::Relaxed),
@@ -255,10 +288,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
             }
         },
         Command::State => {
-            let (leadership, election_state) = {
-                let es = node_state.election_state.lock().unwrap();
-                es.get()
-            };
+            let (leadership, election_state) = get_election_state(node_state);
             println!("leadership: {:?}, elections state: {:?}", leadership, election_state)
             
         }
