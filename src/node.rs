@@ -4,6 +4,7 @@
 
 extern crate rand;
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::collections::BTreeMap;
@@ -52,10 +53,17 @@ pub struct PeerState {
     pub availability: Availability,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub enum ElectionState {
     NonParticipant,
     Participant,
-    Elected,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Leadership {
+    LeaderUnknown,
+    LeaderKnown(Uuid),
+    SelfLeader,
 }
 
 pub struct NodeState {
@@ -63,7 +71,7 @@ pub struct NodeState {
     pub ssl_context: ssl::SslContext,
     pub address_map: Arc<Mutex<BTreeMap<Uuid, Vec<String>>>>,
     pub peers: Arc<Mutex<BTreeMap<Uuid, PeerState>>>,
-    pub election_state: Mutex<ElectionState>,
+    pub election_state: Mutex<Cell<(Leadership, ElectionState)>>,
 }
 
 impl NodeState {
@@ -105,7 +113,8 @@ impl NodeState {
             ssl_context: ssl_context,
             address_map: Arc::new(Mutex::new(addr_map)),
             peers: Arc::new(Mutex::new(peers)),
-            election_state: Mutex::new(ElectionState::NonParticipant),
+            election_state: Mutex::new(Cell::new((Leadership::LeaderUnknown,
+                                                  ElectionState::NonParticipant))),
         })
     }
 }
@@ -280,9 +289,13 @@ pub fn send_message(node_state: Arc<node::NodeState>,
                         } else {
                             {
                                 let mut peers = node_state.peers.lock().unwrap();
-                                let mut peer = peers.get_mut(&to).unwrap();
-                                peer.connect_errors.fetch_add(1, Ordering::Relaxed);
-                                peer.availability = Availability::Down;
+                                match peers.get_mut(&to) {
+                                    Some(peer) => {
+                                        peer.connect_errors.fetch_add(1, Ordering::Relaxed);
+                                        peer.availability = Availability::Down;
+                                    },
+                                    None => {}
+                                }
                             }
                         }
                     } else {
@@ -426,6 +439,15 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
             Some(u) => {
                 info!("UUID of peer: {}", u);
                 {
+                    let es = node_state.election_state.lock().unwrap();
+                    match (es.get().0, u > node_state.config.uuid) {
+                        (Leadership::SelfLeader, true) =>
+                            es.set((Leadership::SelfLeader,
+                                    ElectionState::NonParticipant)),
+                        _ => {}
+                    }
+                };
+                {
                     let mut peers = node_state.peers.lock().unwrap();
                     peers.entry(u).or_insert_with(|| PeerState{uuid: u,
                                                                recv_conns: AtomicUsize::new(0),
@@ -470,6 +492,15 @@ fn send_handler(node_state: Arc<node::NodeState>,
             let (tx, rx) = sync_channel(100);
             info!("UUID of peer: {}", u);
 
+            {
+                let es = node_state.election_state.lock().unwrap();
+                match (es.get().0, u > node_state.config.uuid) {
+                    (Leadership::SelfLeader, true) =>
+                        es.set((Leadership::SelfLeader,
+                                ElectionState::NonParticipant)),
+                    _ => {}
+                }
+            };
             // Make sure the send_handler_loop receives the Hello
             // message before any other message. We do this by sending
             // before entering the sending part of the channel into
@@ -649,6 +680,91 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                     }
                 }
             },
+            message::Message::Election(proposed_uuid) => {
+                let (_leadership, election_state) = {
+                    let es = node_state.election_state.lock().unwrap();
+                    es.get()
+                };
+                let mut uuids = get_peer_uuids_and_addresses(node_state.clone());
+                uuids.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
+                let next_uuid =
+                    match uuids.iter().take_while(|&&(a, _)| a < self_uuid).next() {
+                        None => &uuids[0].0,
+                        Some(u) => &u.0,
+                    };
+                if proposed_uuid > self_uuid {
+                    send_message(node_state.clone(), next_uuid,
+                                 message::Message::Election(proposed_uuid));
+                    {
+                        let es = node_state.election_state.lock().unwrap();
+                        es.set((Leadership::LeaderUnknown, ElectionState::Participant));
+                    };
+                } else if proposed_uuid < self_uuid {
+                    match election_state {
+                        ElectionState::NonParticipant => {
+                            trace!("forwarding election msg for {} to {} (proposed: {}), becoming participant",
+                               self_uuid, next_uuid, proposed_uuid);
+                            send_message(node_state.clone(), next_uuid,
+                                         message::Message::Election(self_uuid));
+                            {
+                                let es = node_state.election_state.lock().unwrap();
+                                es.set((Leadership::LeaderUnknown, ElectionState::Participant));
+                            };
+                        },
+                        ElectionState::Participant => {
+                        }
+                    }
+                } else /* proposed_uuid == self_uuid */ {
+                    match election_state {
+                        ElectionState::NonParticipant => {
+                            error!("got election message with own UUID, but not participant");
+                        },
+                        ElectionState::Participant => {
+                            trace!("got election msg for {} (myself={}), turning to leader",
+                                   proposed_uuid, self_uuid);
+                            send_message(node_state.clone(), next_uuid,
+                                         message::Message::Elected(self_uuid));
+                            {
+                                let es = node_state.election_state.lock().unwrap();
+                                es.set((Leadership::LeaderUnknown,
+                                        ElectionState::NonParticipant));
+                            };
+                        }
+                    }
+                }
+            },
+            message::Message::Elected(elected_uuid) => {
+                let (_leadership, election_state) = {
+                    let es = node_state.election_state.lock().unwrap();
+                    es.get()
+                };
+                let mut uuids = get_peer_uuids_and_addresses(node_state.clone());
+                uuids.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
+                let next_uuid =
+                    match uuids.iter().take_while(|&&(a, _)| a < self_uuid).next() {
+                        None => &uuids[0].0,
+                        Some(u) => &u.0,
+                    };
+                if self_uuid == elected_uuid {
+                    trace!("got elected msg for {} (myself), becoming leader",
+                           elected_uuid);
+                    {
+                        let es = node_state.election_state.lock().unwrap();
+                        es.set((Leadership::SelfLeader,
+                                ElectionState::NonParticipant));
+                    };
+                } else {
+                    trace!("got elected msg for {}, recording as leader",
+                           elected_uuid);
+                    send_message(node_state.clone(), next_uuid,
+                                 message::Message::Elected(elected_uuid));
+                    {
+                        let es = node_state.election_state.lock().unwrap();
+                        es.set((Leadership::LeaderKnown(elected_uuid),
+                                ElectionState::NonParticipant));
+                    };
+                }
+            },
             _ => {
                 handler(d);
             }
@@ -700,49 +816,73 @@ fn chatter_loop(node_state: Arc<NodeState>) {
 
     let self_uuid = node_state.config.uuid;
     loop {
-//        trace!("chatter_loop");
         thread::sleep(time::Duration::from_millis(ITERATION_SLEEP_MS));
-        {
-            let uuids = get_peer_uuids_and_addresses(node_state.clone());
-            for &(u, _) in &uuids {
-                {
-//                    trace!("considering {}", u);
-                    let availability = {
-                        let peers = node_state.peers.lock().unwrap();
-                        peers.get(&u).map(|peer| peer.availability)
+        let mut uuids = get_peer_uuids_and_addresses(node_state.clone());
+
+        if uuids.len() > 0 {
+            let (leadership, _) = {
+                let es = node_state.election_state.lock().unwrap();
+                es.get()
+            };
+
+            match leadership {
+                Leadership::LeaderUnknown => {
+                    uuids.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
+                    let next_uuid =
+                        match uuids.iter().take_while(|&&(a, _)| a < self_uuid).next() {
+                            None => &uuids[0].0,
+                            Some(u) => &u.0,
+                        };
+                    trace!("leadership unknown, sending election for {} to {}",
+                           self_uuid, next_uuid);
+                    send_message(node_state.clone(), next_uuid,
+                                 message::Message::Election(self_uuid));
+                    {
+                        let es = node_state.election_state.lock().unwrap();
+                        es.set((Leadership::LeaderUnknown, ElectionState::Participant));
                     };
-                    match availability {
-                        None => {
-                            if rng.gen::<u8>() % 10 <= 5 {
-                                send_message(node_state.clone(), &u,
-                                             message::Message::Ping(self_uuid))
-                            }
-                        },
-                        Some(Availability::Up) => {
-                                if rng.gen::<u8>() % 10 <= 3 {
-                                let mut us: Vec<(Uuid, String)> = uuids.clone()
-                                    .into_iter()
-                                    .filter(|&(uu,_)| uu != u)
-                                    .collect();
-                                us.push((self_uuid,
-                                         node_state.config.listen_addresses[0].clone()));
-                                send_message(node_state.clone(), &u,
-                                             message::Message::Nodes(us))
-                            } else {
-                                send_message(node_state.clone(), &u,
-                                             message::Message::Ping(self_uuid))
-                            }
-                        },
-                        Some(Availability::Down) => {
-                            if rng.gen::<u8>() % 10 <= 5 {
-                                send_message(node_state.clone(), &u,
-                                             message::Message::Ping(self_uuid))
-                            }
-                        }
+                },
+                _ => {
+                }
+                
+            }
+        }
+        
+        rng.shuffle(uuids.as_mut_slice());
+        for &(u, _) in uuids.iter().take(2) {
+            let availability = {
+                let peers = node_state.peers.lock().unwrap();
+                peers.get(&u).map(|peer| peer.availability)
+            };
+            match availability {
+                None => {
+                    if rng.gen::<u8>() % 10 <= 5 {
+                        send_message(node_state.clone(), &u,
+                                     message::Message::Ping(self_uuid))
                     }
-                    
+                },
+                Some(Availability::Up) => {
+                    if rng.gen::<u8>() % 10 <= 3 {
+                        let mut us: Vec<(Uuid, String)> = uuids.clone()
+                            .into_iter()
+                            .filter(|&(uu,_)| uu != u)
+                            .collect();
+                        us.push((self_uuid,
+                                 node_state.config.listen_addresses[0].clone()));
+                        send_message(node_state.clone(), &u,
+                                     message::Message::Nodes(us))
+                    } else {
+                        send_message(node_state.clone(), &u,
+                                     message::Message::Ping(self_uuid))
+                    }
+                },
+                Some(Availability::Down) => {
+                    if rng.gen::<u8>() % 10 <= 5 {
+                        send_message(node_state.clone(), &u,
+                                     message::Message::Ping(self_uuid))
+                    }
                 }
             }
-        }            
+        }
     }
 }

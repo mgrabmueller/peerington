@@ -74,8 +74,8 @@ fn run(config: Config) {
 enum Command {
     /// Quit the read-eval-print loop.
     Quit,
-    /// Print statistics to the console.
-    Stats,
+    /// Print node state
+    State,
     /// Print all known nodes.
     Nodes,
     /// Send a message to a specific node.
@@ -91,8 +91,8 @@ impl fmt::Display for Command {
         match *self {
             Command::Quit =>
                 write!(f, "quit"),
-            Command::Stats =>
-                write!(f, "stats"),
+            Command::State =>
+                write!(f, "state"),
             Command::Nodes =>
                 write!(f, "nodes"),
             Command::Send(ref u, ref s) =>
@@ -112,8 +112,8 @@ impl Command {
             match tokens[0] {
                 "q" | "qu" | "qui" | "quit" =>
                     Ok(Command::Quit),
-                "s" | "st" | "sta" | "stat" | "stats" =>
-                    Ok(Command::Stats),
+                "s" | "st" | "sta" | "stat" | "state" =>
+                    Ok(Command::State),
                 "nodes" =>
                     Ok(Command::Nodes),
                 "config" =>
@@ -254,7 +254,17 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                 }
             }
         },
-        _ =>
-            println!("You want me to {}?", cmd)
+        Command::State => {
+            let (leadership, election_state) = {
+                let es = node_state.election_state.lock().unwrap();
+                es.get()
+            };
+            println!("leadership: {:?}, elections state: {:?}", leadership, election_state)
+            
+        }
+        Command::Quit => {
+            // Should be handled in caller.
+            unreachable!();
+        }
     };
 }
