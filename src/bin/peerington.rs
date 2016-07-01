@@ -169,13 +169,17 @@ impl <'a> fmt::Display for CommandParseError<'a> {
 }
 
 /// Read-eval-print loop of the peerington command.
-fn repl(_config: Arc<Config>, node_state: Arc<NodeState>) {
-    let prompt = b"peer> ";
+fn repl(config: Arc<Config>, node_state: Arc<NodeState>) {
+    let prompt = config.uuid.hyphenated().to_string();
     let mut input = String::new();
     
     loop {
         input.clear();
-        if let Err(e) = io::stdout().write(prompt) {
+        if let Err(e) = io::stdout().write(&prompt.as_bytes()[..8]) {
+            println!("cannot write prompt: {}", e);
+            return;
+        }
+        if let Err(e) = io::stdout().write(b">") {
             println!("cannot write prompt: {}", e);
             return;
         }
@@ -239,7 +243,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         Command::Peers => {
             match node_state.peers.lock() {
                 Ok(peers) => {
-                    println!("uuid                                      rcv   snd    ce state");
+                    println!(" # SL uuid                                   rcv   snd    ce state   listen");
                     let mut self_addrs = HashSet::new();
                     for a in &node_state.config.listen_addresses {
                         self_addrs.insert(a.clone());
@@ -261,14 +265,15 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                              &self_peer_state));
                     ps.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
 
-                    for &(name, peer_state) in &ps {
+                    for (idx, &(name, peer_state)) in ps.iter().enumerate() {
                         let marker1 = if *name == self_peer_state.uuid {
                             "*" } else { " " };
                         
                         let marker2 = if Some(*name) == current_leader(node_state.clone()) {
                             "L" } else { " " };
                         
-                        println!("{}{} {} {:5} {:5} {:5} {:7} {:?}",
+                        println!("{:2} {}{} {} {:5} {:5} {:5} {:7} {:?}",
+                                 idx,
                                  marker1,
                                  marker2,
                                  name,
