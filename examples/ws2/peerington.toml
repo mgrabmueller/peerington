@@ -1,5 +1,0 @@
-[node]
-uuid = "67898909-458f-4e92-b221-3285c2d504a5"
-listen-addresses = ["localhost:1236"]
-seed-addresses = ["localhost:1234", "localhost:1235"]
-workspace-directory = "examples/ws2"

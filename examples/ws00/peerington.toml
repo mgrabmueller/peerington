@@ -1,0 +1,3 @@
+[node]
+uuid = "981bce55-bac4-4ff3-a5f3-07ba42dcdc98"
+listen-addresses = ["localhost:1234"]

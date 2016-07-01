@@ -1,0 +1,4 @@
+[node]
+uuid = "5ac8a8c6-c3ef-42ad-b957-557a3b6a56c8"
+listen-addresses = ["localhost:1237"]
+seed-addresses = ["localhost:1234", "localhost:1235"]
