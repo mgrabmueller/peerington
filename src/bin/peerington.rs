@@ -7,6 +7,7 @@ extern crate env_logger;
 extern crate uuid;
 
 use std::sync::atomic::AtomicUsize;
+use std::collections::HashSet;
 
 use peerington::config::get_config;
 use peerington::config::print_usage;
@@ -15,6 +16,8 @@ use peerington::config::Config;
 use peerington::node::NodeState;
 use peerington::node::PeerState;
 use peerington::node::Availability;
+use peerington::node::Leadership;
+use peerington::node::ElectionState;
 use peerington::node::start_networking;
 use peerington::node::send_message;
 use peerington::node::get_election_state;
@@ -80,10 +83,10 @@ fn run(config: Config) {
 enum Command {
     /// Quit the read-eval-print loop.
     Quit,
+    /// Give some help on the REPL.
+    Help,
     /// Print node state
     State,
-    /// Print all known nodes.
-    Nodes,
     /// Send a message to a specific node.
     Send(Uuid, String),
     /// Show configuration.
@@ -97,10 +100,10 @@ impl fmt::Display for Command {
         match *self {
             Command::Quit =>
                 write!(f, "quit"),
+            Command::Help =>
+                write!(f, "help"),
             Command::State =>
                 write!(f, "state"),
-            Command::Nodes =>
-                write!(f, "nodes"),
             Command::Send(ref u, ref s) =>
                 write!(f, "send {} {}", u, s),
             Command::Config =>
@@ -116,15 +119,15 @@ impl Command {
         let tokens: Vec<_> = input.split(' ').collect();
         if tokens.len() > 0 {
             match tokens[0] {
-                "q" | "qu" | "qui" | "quit" =>
+                "q" | "quit" =>
                     Ok(Command::Quit),
-                "s" | "st" | "sta" | "stat" | "state" =>
+                "h" | "help" =>
+                    Ok(Command::Help),
+                "s" | "state" =>
                     Ok(Command::State),
-                "nodes" =>
-                    Ok(Command::Nodes),
-                "config" =>
+                "c" | "config" =>
                     Ok(Command::Config),
-                "p" | "pe" | "pee" | "peer" | "peers" =>
+                "p" | "peers" =>
                     Ok(Command::Peers),
                 "send" => {
                     if tokens.len() > 2 {
@@ -207,19 +210,13 @@ fn repl(_config: Arc<Config>, node_state: Arc<NodeState>) {
 /// Execute a peerington command.
 fn execute(cmd: Command, node_state: Arc<NodeState>) {
     match cmd {
-        Command::Nodes => {
-            println!("addresses:");
-            match node_state.address_map.read() {
-                Ok(addr_map) => {
-                    for (name, addr) in &*addr_map {
-                        println!("  {}: {:?}", name, addr);
-                    }
-                    ()
-                }
-                Err(_) => {
-                    println!("cannot lock node map");
-                }
-            }
+        Command::Help => {
+            println!("  help              display this help message");
+            println!("  quit              terminate this node");
+            println!("  send UUID MSG     send the text MSG to node UUID");
+            println!("  peers             display the node ring");
+            println!("  config            display the node configuration");
+            println!("  state             display the state of this node");
         },
         Command::Send(uuid, msg) => {
             println!("sending...");
@@ -228,6 +225,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         },
         Command::Config => {
             let config = &node_state.config;
+            println!("uuid: {}", config.uuid.hyphenated());
             println!("listening on:");
             for ref a in &config.listen_addresses {
                 println!("  {}", a);
@@ -237,21 +235,23 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                 println!("  {}", a);
             }
             println!("workspace: {}", config.workspace_dir);
-            println!("node uuid: {}", config.uuid.hyphenated());
             },
         Command::Peers => {
             match node_state.peers.lock() {
                 Ok(peers) => {
-                    println!("uuid                                      rcv   snd    re    se    ce state");
+                    println!("uuid                                      rcv   snd    ce state");
+                    let mut self_addrs = HashSet::new();
+                    for a in &node_state.config.listen_addresses {
+                        self_addrs.insert(a.clone());
+                    }
                     let self_peer_state =
                         PeerState{uuid: node_state.config.uuid,
                                   recv_conns: AtomicUsize::new(0),
                                   send_conns: AtomicUsize::new(0),
-                                  send_errors: AtomicUsize::new(0),
-                                  recv_errors: AtomicUsize::new(0),
                                   connect_errors: AtomicUsize::new(0),
                                   send_channel: None,
-                                  availability: Availability::Up};
+                                  availability: Some(Availability::Up),
+                                  addresses: self_addrs};
                     let mut ps = Vec::new();
                     for (name, peer_state) in &*peers {
                         ps.push((name, peer_state));
@@ -261,23 +261,26 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                              &self_peer_state));
                     ps.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
 
-                    for (name, peer_state) in ps {
+                    for &(name, peer_state) in &ps {
                         let marker1 = if *name == self_peer_state.uuid {
                             "*" } else { " " };
                         
                         let marker2 = if Some(*name) == current_leader(node_state.clone()) {
                             "L" } else { " " };
                         
-                        println!("{}{} {} {:5} {:5} {:5} {:5} {:5} {:5?}",
+                        println!("{}{} {} {:5} {:5} {:5} {:7} {:?}",
                                  marker1,
                                  marker2,
                                  name,
                                  peer_state.recv_conns.load(Ordering::Relaxed),
                                  peer_state.send_conns.load(Ordering::Relaxed),
-                                 peer_state.recv_errors.load(Ordering::Relaxed),
-                                 peer_state.send_errors.load(Ordering::Relaxed),
                                  peer_state.connect_errors.load(Ordering::Relaxed),
-                                 peer_state.availability,
+                                 match peer_state.availability {
+                                     None => "unknown",
+                                     Some(Availability::Up) => "up",
+                                     Some(Availability::Down) => "down",
+                                 },
+                                 peer_state.addresses
                         );
                     }
                     ()
@@ -288,9 +291,18 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
             }
         },
         Command::State => {
-            let (leadership, election_state) = get_election_state(node_state);
-            println!("leadership: {:?}, elections state: {:?}", leadership, election_state)
-            
+            let (leadership, election_state) = get_election_state(node_state.clone());
+            println!("uuid:   {}", node_state.config.uuid);
+            println!("leader: {} {}",
+                     match leadership {
+                         Leadership::SelfLeader => format!("{}", node_state.config.uuid),
+                         Leadership::LeaderKnown(u) => format!("{}", u),
+                         Leadership::LeaderUnknown => "unknown".to_string(),
+                     },
+                     match election_state {
+                         ElectionState::Participant => "(election in progress)",
+                         ElectionState::NonParticipant => "",
+                     });
         }
         Command::Quit => {
             // Should be handled in caller.
