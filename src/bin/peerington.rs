@@ -179,7 +179,7 @@ fn repl(config: Arc<Config>, node_state: Arc<NodeState>) {
             println!("cannot write prompt: {}", e);
             return;
         }
-        if let Err(e) = io::stdout().write(b">") {
+        if let Err(e) = io::stdout().write(b"> ") {
             println!("cannot write prompt: {}", e);
             return;
         }
