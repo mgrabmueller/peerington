@@ -340,8 +340,14 @@ pub fn send_message(node_state: Arc<node::NodeState>,
     }
 }
 
+/// Read a single message from the given stream. `buffer` is a vector
+/// that may or may not be empty, if there is data contained, it will
+/// be prefixed to the data read from the stream to handle leftovers
+/// from earlier calls.
 fn read_message(stream: &mut ssl::SslStream<TcpStream>,
-                buffer: &mut Vec<u8>) -> Result<(message::Message, Vec<u8>), error::Error> {
+                buffer: &mut Vec<u8>) ->
+    Result<(message::Message, Vec<u8>), error::Error>
+{
     let mut buf = [0; 1024];
     let n = try!(stream.ssl_read(&mut buf));
 
@@ -353,6 +359,9 @@ fn read_message(stream: &mut ssl::SslStream<TcpStream>,
     Ok((message, rest))
 }
 
+/// Read a single handshake message from the stream and return the
+/// minimum and maximum supported protocol version as well as leftover
+/// data from the underlying stream.
 fn read_handshake(stream: &mut ssl::SslStream<TcpStream>) ->
     Result<(message::Version, message::Version, Vec<u8>), error::Error>
 {
@@ -366,7 +375,11 @@ fn read_handshake(stream: &mut ssl::SslStream<TcpStream>) ->
     }
 }
 
-fn write_message(stream: &mut ssl::SslStream<TcpStream>, msg: message::Message) -> Result<(), error::Error> {
+/// Write a single message to the given stream, making sure that it
+/// was sent completely.
+fn write_message(stream: &mut ssl::SslStream<TcpStream>, msg: message::Message) ->
+    Result<(), error::Error>
+{
     let buf = Vec::new();
     let mut c = Cursor::new(buf);
     try!(msg.write(&mut c));
@@ -380,7 +393,12 @@ fn write_message(stream: &mut ssl::SslStream<TcpStream>, msg: message::Message) 
     }
 }
 
-fn recv_negotiate_version(stream: &mut ssl::SslStream<TcpStream>) -> Result<(message::Version, Vec<u8>), error::Error> {
+/// Negotiate the protocol version with the connecting node on the
+/// other side of the stream.  Return the negotiated version and
+/// leftovers on success, and an error otherwise.
+fn recv_negotiate_version(stream: &mut ssl::SslStream<TcpStream>) ->
+    Result<(message::Version, Vec<u8>), error::Error>
+{
     let (version_offered_min, version_offered_max, rest) = try!(read_handshake(stream));
 
     if version_offered_min > message::MAX_SUPPORTED_VERSION {
@@ -401,6 +419,10 @@ fn recv_negotiate_version(stream: &mut ssl::SslStream<TcpStream>) -> Result<(mes
     }
 }
 
+/// Negotiate the protocol version with the node to which we have
+/// connected.  Return the negotiated version and the maximum
+/// supported version on the other side plus leftovers on success, and
+/// an error otherwise.
 fn send_negotiate_version(stream: &mut ssl::SslStream<TcpStream>) ->
     Result<(message::Version, message::Version, Vec<u8>), error::Error>
 {
@@ -534,6 +556,13 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
 
                 recv_handler_loop(stream, &mut msg, proto_version, sender);
 
+                {
+                    let mut peers = node_state.peers.lock().unwrap();
+                    if let Some(pe) = peers.get_mut(&u) {
+                        pe.proto_version_recv = None;
+                    }
+                }
+
                 if let Some(cur_leader) = current_leader(node_state.clone()) {
                     if cur_leader == u {
                         forget_leader(node_state.clone());
@@ -566,6 +595,7 @@ fn send_handler(node_state: Arc<node::NodeState>,
             let (tx, rx) = sync_channel(100);
             info!("{} connected", u);
 
+            // Negotiate protocol version.
             let (proto_version, _proto_version_max, _msg) =
                 match send_negotiate_version(stream) {
                     Ok(rest) => rest,
@@ -601,6 +631,7 @@ fn send_handler(node_state: Arc<node::NodeState>,
                 tx.send(node_msg).unwrap();
             }
 
+            // Now that the connection was established
             {
                 let mut peers = node_state.peers.lock().unwrap();
                 let ps = peers.entry(u)
@@ -620,7 +651,14 @@ fn send_handler(node_state: Arc<node::NodeState>,
 
             send_handler_loop(stream, proto_version, rx);
 
-            if let Some(cur_leader) = current_leader(node_state.clone()) {
+             {
+                let mut peers = node_state.peers.lock().unwrap();
+                if let Some(ps) = peers.get_mut(&u) {
+                    ps.proto_version_send = None;
+                    ps.send_channel = None;
+                }
+            }
+           if let Some(cur_leader) = current_leader(node_state.clone()) {
                 if cur_leader == u {
                     forget_leader(node_state.clone());
                 }
