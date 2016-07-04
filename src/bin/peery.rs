@@ -25,8 +25,6 @@ use peerington::message::Version;
 
 use uuid::Uuid;
 
-use std::sync::atomic::Ordering;
-use std::sync::atomic::AtomicUsize;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::env;
@@ -244,7 +242,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         Command::Peers => {
             match node_state.peers.lock() {
                 Ok(peers) => {
-                    println!(" # SL uuid                                   rcv   snd    ce  rver  sver state   listen");
+                    println!(" # SL uuid                                     ce  rver  sver state   listen");
                     let mut self_addrs = HashSet::new();
                     for a in &node_state.config.listen_addresses {
                         self_addrs.insert(a.clone());
@@ -253,9 +251,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                         PeerState{uuid: node_state.config.uuid,
                                   proto_version_send: None,
                                   proto_version_recv: None,
-                                  recv_conns: AtomicUsize::new(0),
-                                  send_conns: AtomicUsize::new(0),
-                                  connect_errors: AtomicUsize::new(0),
+                                  connect_errors: 0,
                                   send_channel: None,
                                   availability: Some(Availability::Up),
                                   addresses: self_addrs};
@@ -280,14 +276,12 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                         if is_leader {
                             t.attr(term::Attr::Standout(true)).unwrap();
                         } 
-                        println!("{:2} {}{} {} {:5} {:5} {:5} {:5} {:5} {:7} {:?}",
+                        println!("{:2} {}{} {} {:5} {:5} {:5} {:7} {:?}",
                                  idx,
                                  if is_self { "*" } else { " " },
                                  if is_leader { "L" } else { " " },
                                  name,
-                                 peer_state.recv_conns.load(Ordering::Relaxed),
-                                 peer_state.send_conns.load(Ordering::Relaxed),
-                                 peer_state.connect_errors.load(Ordering::Relaxed),
+                                 peer_state.connect_errors,
                                  peer_state.proto_version_recv.unwrap_or(Version(0)).number(),
                                  peer_state.proto_version_send.unwrap_or(Version(0)).number(),
                                  match peer_state.availability {

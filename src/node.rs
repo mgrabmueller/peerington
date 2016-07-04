@@ -21,8 +21,6 @@ use std::cmp;
 use std::sync::mpsc::SyncSender;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::sync_channel;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::time;
 
 use self::rand::Rng;
@@ -67,17 +65,11 @@ pub struct PeerState {
     /// if known.
     pub proto_version_recv: Option<message::Version>,
 
-    /// Number of active receive connections.
-    pub recv_conns: AtomicUsize,
-
-    /// Number of active send connections.
-    pub send_conns: AtomicUsize,
-
     /// Internal channel for sending messages to the node.
     pub send_channel: Option<SyncSender<message::Message>>,
 
     /// Number of connection errors that have been detected.
-    pub connect_errors: AtomicUsize,
+    pub connect_errors: usize,
 
     /// Currently known availability of the node.
     pub availability: Option<Availability>,
@@ -311,7 +303,7 @@ pub fn send_message(node_state: Arc<node::NodeState>,
                             {
                                 let mut peers = node_state.peers.lock().unwrap();
                                 let mut peer = peers.get_mut(&to).unwrap();
-                                peer.connect_errors.store(0, Ordering::Relaxed);
+                                peer.connect_errors = 0;
                                 peer.availability = Some(Availability::Up);
                             }
                             let tx = node::find_send_channel(node_state, to);
@@ -329,7 +321,7 @@ pub fn send_message(node_state: Arc<node::NodeState>,
                                 let mut peers = node_state.peers.lock().unwrap();
                                 match peers.get_mut(&to) {
                                     Some(peer) => {
-                                        peer.connect_errors.fetch_add(1, Ordering::Relaxed);
+                                        peer.connect_errors += 1;
                                         peer.availability = Some(Availability::Down);
                                     },
                                     None => {}
@@ -533,13 +525,10 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                         .or_insert_with(|| PeerState{uuid: u,
                                                      proto_version_send: None,
                                                      proto_version_recv: None,
-                                                     recv_conns: AtomicUsize::new(0),
-                                                     send_conns: AtomicUsize::new(0),
-                                                     connect_errors: AtomicUsize::new(0),
+                                                     connect_errors: 0,
                                                      send_channel: None,
                                                      availability: Some(Availability::Up),
                                                      addresses: HashSet::new()});
-                    pe.recv_conns.fetch_add(1, Ordering::Relaxed);
                     pe.proto_version_recv = Some(proto_version);
                 }
 
@@ -549,10 +538,6 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                     if cur_leader == u {
                         forget_leader(node_state.clone());
                     }
-                }
-                {
-                    let peers = node_state.peers.lock().unwrap();
-                    peers.get(&u).unwrap().recv_conns.fetch_sub(1, Ordering::Relaxed);
                 }
                 info!("{} disconnected", u);
             }
@@ -622,13 +607,10 @@ fn send_handler(node_state: Arc<node::NodeState>,
                     .or_insert_with(|| PeerState{uuid: u,
                                                  proto_version_send: None,
                                                  proto_version_recv: None,
-                                                 recv_conns: AtomicUsize::new(0),
-                                                 send_conns: AtomicUsize::new(0),
-                                                 connect_errors: AtomicUsize::new(0),
+                                                 connect_errors: 0,
                                                  send_channel: None,
                                                  availability: Some(Availability::Up),
                                                  addresses: HashSet::new()});
-                ps.send_conns.fetch_add(1, Ordering::Relaxed);
                 ps.proto_version_send = Some(proto_version);
                 ps.send_channel = Some(tx);
                 ps.addresses.insert(peer.to_string());
@@ -642,10 +624,6 @@ fn send_handler(node_state: Arc<node::NodeState>,
                 if cur_leader == u {
                     forget_leader(node_state.clone());
                 }
-            }
-            {
-                let peers = node_state.peers.lock().unwrap();
-                peers.get(&u).unwrap().send_conns.fetch_sub(1, Ordering::Relaxed);
             }
             info!("{} connected", u);
         }
@@ -811,9 +789,7 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                             .or_insert_with(|| PeerState{uuid: u,
                                                          proto_version_send: None,
                                                          proto_version_recv: None,
-                                                         recv_conns: AtomicUsize::new(0),
-                                                         send_conns: AtomicUsize::new(0),
-                                                         connect_errors: AtomicUsize::new(0),
+                                                         connect_errors: 0,
                                                          send_channel: None,
                                                          availability: None,
                                                          addresses: HashSet::new()})
@@ -1100,7 +1076,7 @@ fn chatter_loop(node_state: Arc<NodeState>) {
                 Some(Availability::Down) => {
                     let conn_err_cnt  = {
                         let peers = node_state.peers.lock().unwrap();
-                        peers.get(&u).map(|peer| peer.connect_errors.load(Ordering::Relaxed)).unwrap_or(0)
+                        peers.get(&u).map(|peer| peer.connect_errors).unwrap_or(0)
                     };
                     let prob = cmp::max(1, 100 / cmp::min(100, 2usize.pow(cmp::min(10, conn_err_cnt) as u32)));
                     if rng.gen::<usize>() % 100 <= prob {
