@@ -11,13 +11,26 @@ use toml;
 use openssl::ssl;
 use uuid;
 
+use message;
+
+/// Errors that may happen during the operation of Peerington.
 #[derive(Debug)]
 pub enum Error {
+    /// IO Error.
     Io(io::Error),
-    Ssl(ssl::error::SslError),
+    /// Error on TLS connections.
+    Ssl(ssl::error::Error),
+    /// Error on TLS connections.
+    SslError(ssl::error::SslError),
+    /// Error on UUID handling.
     UuidParse(uuid::ParseError),
+    /// Error in the inter-node message processing.
     MessageParse(&'static str),
+    /// General error in UTF-8 encoding/decpding handling.
     Utf8(string::FromUtf8Error),
+    /// Protocol version negotiation failed.
+    ProtocolVersion(message::Version, message::Version),
+    /// Other error.
     Other(&'static str),
 }
 
@@ -26,9 +39,13 @@ impl fmt::Display for Error {
         match *self {
             Error::Io(ref err) => write!(f, "IO error: {}", err),
             Error::Ssl(ref err) => write!(f, "SSL error: {}", err),
-            Error::UuidParse(ref err) => write!(f, "uuid error: {}", err),
-            Error::MessageParse(s) => write!(f, " message parse error: {}", s),
-            Error::Utf8(ref err) => write!(f, " from utf8 error: {}", err),
+            Error::SslError(ref err) => write!(f, "SSL error: {}", err),
+            Error::UuidParse(ref err) => write!(f, "UUID error: {}", err),
+            Error::MessageParse(s) => write!(f, "message parse error: {}", s),
+            Error::Utf8(ref err) => write!(f, "UTF-8 error: {}", err),
+            Error::ProtocolVersion(offered_min, offered_max) =>
+                write!(f, "protocol version negotation failed: offered min: {}, max: {}",
+                       offered_min, offered_max),
             Error::Other(s) => write!(f, "{}", s),
         }
     }
@@ -36,16 +53,18 @@ impl fmt::Display for Error {
 
 impl error::Error for Error {
     fn description(&self) -> &str {
-        // Both underlying errors already impl `Error`, so we defer to their
-        // implementations.
+        // Both underlying errors already impl `Error`, so we defer to
+        // their implementations.
         match *self {
             Error::Io(ref err) => err.description(),
             Error::Ssl(ref err) => err.description(),
+            Error::SslError(ref err) => err.description(),
             // FIXME: Not working with stable Rust right now?
             // Error::UuidParse(ref err) => err.description(),
             Error::UuidParse(_) => "uuid parse error",
             Error::MessageParse(s) => s,
             Error::Utf8(ref err) => err.description(),
+            Error::ProtocolVersion(_, _) => "protocol negotiation error",
             Error::Other(s) => s,
         }
     }
@@ -54,11 +73,13 @@ impl error::Error for Error {
         match *self {
             Error::Io(ref err) => Some(err),
             Error::Ssl(ref err) => Some(err),
+            Error::SslError(ref err) => Some(err),
             // FIXME: Not working with stable Rust right now?
             // Error::UuidParse(ref err) => Some(err),
             Error::UuidParse(_) => None,
             Error::MessageParse(_) => None,
             Error::Utf8(ref err) => Some(err),
+            Error::ProtocolVersion(_, _) => None,
             Error::Other(_) => None,
         }
     }
@@ -70,9 +91,15 @@ impl From<io::Error> for Error {
     }
 }
 
+impl From<ssl::error::Error> for Error {
+    fn from(err: ssl::error::Error) -> Error {
+        Error::Ssl(err)
+    }
+}
+
 impl From<ssl::error::SslError> for Error {
     fn from(err: ssl::error::SslError) -> Error {
-        Error::Ssl(err)
+        Error::SslError(err)
     }
 }
 
@@ -93,7 +120,7 @@ pub enum ConfigError {
     /// IO error, for example when reading a configuration from a
     /// file.
     Io(io::Error),
-    /// The user has given the `-h' or `--help' options.
+    /// The user has given the `-h` or `--help` options.
     HelpRequested(super::getopts::Options),
     /// No listen address was specified.
     NoListenAddress,

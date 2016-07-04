@@ -4,6 +4,7 @@
 
 use std::io::Read;
 use std::io::Write;
+use std::fmt;
 use std::u16;
 
 use uuid::Uuid;
@@ -13,17 +14,76 @@ use byteorder::WriteBytesExt;
 
 use super::error;
 
+/// Maximum supported inter-node protocol version that this version of
+/// the library supports.
+pub const MAX_SUPPORTED_VERSION: Version = Version(1);
+
+/// Minimum supported inter-node protocol version that this version of
+/// the library supports.
+pub const MIN_SUPPORTED_VERSION: Version = Version(1);
+
+/// Newtype wrapper for a protocol version number.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version(pub u16);
+
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Version(v) => write!(f, "{}", v),
+        }
+    }
+}
+
+impl Version {
+    pub fn number(&self) -> u16 {
+        match *self {
+            Version(v) => v
+        }
+    }
+}
+
+/// Message type for inter-node communications.
 #[derive(Debug)]
 pub enum Message {
+    /// Message for establishing the inter-node protocol.  This is the
+    /// first message on establishing a connection and is sent by the
+    /// connecting node.  It contains the highest version that the
+    /// connecting node supports.
+    Handshake(Version, Version),
+    /// This is the response to a handshake message. It contains two
+    /// versions: the first is the version the accepting peer is
+    /// offering, and the second is the maximum version supported by
+    /// the accepting node.
+    HandshakeAck(Version, Version),
+    /// This is the failure response to a handshake message. It
+    /// contains the minimum and maximum supported protocol version.
+    /// the accepting node.
+    HandshakeNak(Version, Version),
     /// Message announcing the listening addresses of a node.  This is
     /// the first message sent when connecting to a listening node and
     /// may be sent again during the lifetime of a connection.
     Hello(Uuid, Vec<String>),
+    /// A simple text transmission message, used for debugging.
     Broadcast(String),
+    /// A periodic heartbeat message.  The included UUID is the id of
+    /// the sender.
     Ping(Uuid),
+    /// Response to the `Ping` message.  The included UUID is the id
+    /// of the sender.
     Pong(Uuid),
+    /// Node information message. This is sent on connection
+    /// establishment (both by the connecting and the accepting node)
+    /// and periodically.  It contains a list of all nodes known to
+    /// the sending node.  Each entry is a tuple of the known node's
+    /// UUID and one listening address.
     Nodes(Vec<(Uuid, String)>),
+    /// Election message. To start an election, a node sends this
+    /// message to the next one in the node ring.  The included UUID
+    /// is the current leader suggestion.
     Election(Uuid),
+    /// Elected message.  As soon as the the previous election phase
+    /// has selected a leader, this message announcing the UUID of the
+    /// new leader is sent around the ring.
     Elected(Uuid),
 }
 
@@ -31,6 +91,21 @@ impl Message {
     pub fn read<R: Read>(r: &mut R) -> Result<Message, error::Error>  {
         let tag = try!(r.read_u8());
         match tag {
+            1 => {
+                let version_offered_min = try!(r.read_u16::<BigEndian>());
+                let version_offered_max = try!(r.read_u16::<BigEndian>());
+                Ok(Message::Handshake(Version(version_offered_min), Version(version_offered_max)))
+            },
+            2 => {
+                let version_agreed = try!(r.read_u16::<BigEndian>());
+                let version_supported = try!(r.read_u16::<BigEndian>());
+                Ok(Message::HandshakeAck(Version(version_agreed), Version(version_supported)))
+            },
+            3 => {
+                let version_min = try!(r.read_u16::<BigEndian>());
+                let version_max = try!(r.read_u16::<BigEndian>());
+                Ok(Message::HandshakeNak(Version(version_min), Version(version_max)))
+            },
             10 => {
                 let mut buf = [0; 16];
                 try!(r.read_exact(&mut buf));
@@ -100,6 +175,24 @@ impl Message {
 
     pub fn write<W: Write>(&self, w: &mut W) -> Result<(), error::Error> {
         match *self {
+            Message::Handshake(Version(version_offered_min), Version(version_offered_max)) => {
+                try!(w.write_u8(1));
+                try!(w.write_u16::<BigEndian>(version_offered_min));
+                try!(w.write_u16::<BigEndian>(version_offered_max));
+                Ok(())
+            },
+            Message::HandshakeAck(Version(version_agreed), Version(version_supported)) => {
+                try!(w.write_u8(2));
+                try!(w.write_u16::<BigEndian>(version_agreed));
+                try!(w.write_u16::<BigEndian>(version_supported));
+                Ok(())
+            },
+            Message::HandshakeNak(Version(version_min), Version(version_max)) => {
+                try!(w.write_u8(3));
+                try!(w.write_u16::<BigEndian>(version_min));
+                try!(w.write_u16::<BigEndian>(version_max));
+                Ok(())
+            },
             Message::Hello(uuid, ref addrs) => {
                 try!(w.write_u8(10));
 

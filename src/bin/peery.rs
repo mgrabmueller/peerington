@@ -21,6 +21,7 @@ use peerington::node::send_message;
 use peerington::node::get_election_state;
 use peerington::node::current_leader;
 use peerington::message::Message;
+use peerington::message::Version;
 
 use uuid::Uuid;
 
@@ -243,13 +244,15 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         Command::Peers => {
             match node_state.peers.lock() {
                 Ok(peers) => {
-                    println!(" # SL uuid                                   rcv   snd    ce state   listen");
+                    println!(" # SL uuid                                   rcv   snd    ce  rver  sver state   listen");
                     let mut self_addrs = HashSet::new();
                     for a in &node_state.config.listen_addresses {
                         self_addrs.insert(a.clone());
                     }
                     let self_peer_state =
                         PeerState{uuid: node_state.config.uuid,
+                                  proto_version_send: None,
+                                  proto_version_recv: None,
                                   recv_conns: AtomicUsize::new(0),
                                   send_conns: AtomicUsize::new(0),
                                   connect_errors: AtomicUsize::new(0),
@@ -277,7 +280,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                         if is_leader {
                             t.attr(term::Attr::Standout(true)).unwrap();
                         } 
-                        println!("{:2} {}{} {} {:5} {:5} {:5} {:7} {:?}",
+                        println!("{:2} {}{} {} {:5} {:5} {:5} {:5} {:5} {:7} {:?}",
                                  idx,
                                  if is_self { "*" } else { " " },
                                  if is_leader { "L" } else { " " },
@@ -285,6 +288,8 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                                  peer_state.recv_conns.load(Ordering::Relaxed),
                                  peer_state.send_conns.load(Ordering::Relaxed),
                                  peer_state.connect_errors.load(Ordering::Relaxed),
+                                 peer_state.proto_version_recv.unwrap_or(Version(0)).number(),
+                                 peer_state.proto_version_send.unwrap_or(Version(0)).number(),
                                  match peer_state.availability {
                                      None => "unknown",
                                      Some(Availability::Up) => "up",

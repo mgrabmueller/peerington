@@ -130,7 +130,7 @@ fn extract_config(value: &toml::Table) -> Result<FileConfig, error::ConfigError>
 
 }
 
-/// Parse config file in TOML format. Either return a `FileConfig'
+/// Parse config file in TOML format. Either return a `FileConfig`
 /// value or an error. Note that in config files, some values are
 /// optional which are not optional on the command line.
 pub fn parse_config<P: AsRef<Path>>(fname: P) -> Result<FileConfig, error::ConfigError> {
@@ -149,7 +149,7 @@ pub fn parse_config<P: AsRef<Path>>(fname: P) -> Result<FileConfig, error::Confi
 }
 
 /// Merges command line options and settings from a TOML config file
-/// into a `Config' value.  Command line options have precedence, that
+/// into a `Config` value.  Command line options have precedence, that
 /// means that if a value is set both on the command line and in the
 /// config file, the value on the command line is used.  Note
 /// especially that lists of values (like listen and seed addresses)
@@ -202,7 +202,7 @@ pub fn merge_configs(cmd_config: &CmdLineConfig, file_config: &FileConfig) ->
 }
 
 /// Parse allowed options for a peerington node.  Either return a
-/// complete `Config' value or an error value.  Note that on the
+/// complete `Config` value or an error value.  Note that on the
 /// command line, other values might be optional than in a config
 /// file.
 pub fn parse_opts(args: Vec<String>) -> Result<CmdLineConfig, error::ConfigError> {
@@ -265,6 +265,15 @@ pub fn parse_opts(args: Vec<String>) -> Result<CmdLineConfig, error::ConfigError
     };
 }
 
+/// Get the configuration from the given command line arguments and
+/// from the configuration file, which is either the one explicitly
+/// given with the `-c, --config` option, or the file
+/// `peerington.toml` in the workspace directory given with the `-w,
+/// --workspace` option.
+///
+/// Command line options and configuration file values are merged,
+/// where command line options are preferred over the config file
+/// entries.
 pub fn get_config(args: Vec<String>) ->
     Result<Config, error::ConfigError>
 {

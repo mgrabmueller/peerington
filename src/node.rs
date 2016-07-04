@@ -59,6 +59,14 @@ pub struct PeerState {
     /// UUID of the peer.
     pub uuid: Uuid,
 
+    /// Protocol version used for sending messages to this peer, if
+    /// known.
+    pub proto_version_send: Option<message::Version>,
+
+    /// Protocol version used for receiving messages from this peer,
+    /// if known.
+    pub proto_version_recv: Option<message::Version>,
+
     /// Number of active receive connections.
     pub recv_conns: AtomicUsize,
 
@@ -132,7 +140,6 @@ impl NodeState {
         let mut ca_path = config.workspace_dir.clone();
         ca_path.push_str("/ca-chain.cert.pem");
 
-        trace!("setting ca file");
         try!(ssl_context.set_CA_file(&ca_path));
 
         let mut cert_path = config.workspace_dir.clone();
@@ -140,7 +147,6 @@ impl NodeState {
         cert_path.push_str(&config.uuid.to_string());
         cert_path.push_str(".cert.pem");
 
-        trace!("setting certificate file");
         try!(ssl_context.set_certificate_file(&cert_path, x509::X509FileType::PEM));
 
         let mut priv_key_path = config.workspace_dir.clone();
@@ -148,7 +154,6 @@ impl NodeState {
         priv_key_path.push_str(&config.uuid.to_string());
         priv_key_path.push_str(".key.pem");
 
-        trace!("setting private key file");
         try!(ssl_context.set_private_key_file(&priv_key_path,
                                               x509::X509FileType::PEM));
         try!(ssl_context.check_private_key());
@@ -343,35 +348,101 @@ pub fn send_message(node_state: Arc<node::NodeState>,
     }
 }
 
+fn read_message(stream: &mut ssl::SslStream<TcpStream>,
+                buffer: &mut Vec<u8>) -> Result<(message::Message, Vec<u8>), error::Error> {
+    let mut buf = [0; 1024];
+    let n = try!(stream.ssl_read(&mut buf));
+
+    buffer.extend(&buf[0..n]);
+    let mut c = Cursor::new(buffer.clone());
+    let message = try!(message::Message::read(&mut c));
+    let pos = c.position();
+    let rest = buffer.split_off(pos as usize);
+    Ok((message, rest))
+}
+
+fn read_handshake(stream: &mut ssl::SslStream<TcpStream>) ->
+    Result<(message::Version, message::Version, Vec<u8>), error::Error>
+{
+    let mut msg = Vec::new();
+    let message = try!(read_message(stream, &mut msg));
+    match message {
+        (message::Message::Handshake(version_offered_min, version_offered_max), rest) =>
+            Ok((version_offered_min, version_offered_max, rest)),
+        _ =>
+            Err(error::Error::Other("unexpected message in protocol negotiation"))
+    }
+}
+
+fn write_message(stream: &mut ssl::SslStream<TcpStream>, msg: message::Message) -> Result<(), error::Error> {
+    let buf = Vec::new();
+    let mut c = Cursor::new(buf);
+    try!(msg.write(&mut c));
+    let v = c.into_inner();
+    let n = v.len();
+    let x = try!(stream.ssl_write(&v));
+    if x != n {
+        Err(error::Error::Other("could not write everything"))
+    } else {
+        Ok(())
+    }
+}
+
+fn recv_negotiate_version(stream: &mut ssl::SslStream<TcpStream>) -> Result<(message::Version, Vec<u8>), error::Error> {
+    let (version_offered_min, version_offered_max, rest) = try!(read_handshake(stream));
+
+    if version_offered_min > message::MAX_SUPPORTED_VERSION {
+        error!("version in connection attempt unsupported (too high), closing connection");
+        try!(write_message(stream, message::Message::HandshakeNak(message::MIN_SUPPORTED_VERSION,
+                                                                   message::MAX_SUPPORTED_VERSION)));
+        Err(error::Error::Other("connecting version not supported (too high)"))
+    } else if version_offered_max < message::MIN_SUPPORTED_VERSION {
+        try!(write_message(stream, message::Message::HandshakeNak(message::MIN_SUPPORTED_VERSION,
+                                                                   message::MAX_SUPPORTED_VERSION)));
+        Err(error::Error::Other("connecting version not supported (too low)"))
+    } else {
+        let version_agreed = cmp::max(cmp::max(version_offered_min, message::MIN_SUPPORTED_VERSION),
+                                      cmp::min(version_offered_max, message::MAX_SUPPORTED_VERSION));
+        try!(write_message(stream, message::Message::HandshakeAck(version_agreed,
+                                                                  message::MAX_SUPPORTED_VERSION)));
+        Ok((version_agreed, rest))
+    }
+}
+
+fn send_negotiate_version(stream: &mut ssl::SslStream<TcpStream>) ->
+    Result<(message::Version, message::Version, Vec<u8>), error::Error>
+{
+    try!(write_message(stream, message::Message::Handshake(message::MIN_SUPPORTED_VERSION, message::MAX_SUPPORTED_VERSION)));
+    let mut msg = Vec::new();
+    let message = try!(read_message(stream, &mut msg));
+    match message {
+        (message::Message::HandshakeAck(version_agreed, version_max), rest) => {
+            Ok((version_agreed, version_max, rest))
+        },
+        (message::Message::HandshakeNak(version_min, version_max), _rest) => {
+            return Err(error::Error::ProtocolVersion(version_min, version_max))
+        },
+        _ => {
+            Err(error::Error::Other("unexpected message in protocol negotiation"))
+        }
+    }
+}
+
 /// Loop reading data from a connected node, decoding messages and
 /// forwarding them to the given channel.
 fn recv_handler_loop(stream: &mut ssl::SslStream<TcpStream>,
+                     msg: &mut Vec<u8>,
+                     _proto_version: message::Version,
                      sender: SyncSender<message::Message>) {
-    let mut buf = [0; 1024];
-    let mut msg = Vec::new();
     loop {
-        match stream.ssl_read(&mut buf) {
-            Ok(0) =>
-                break,
-            Ok(n) => {
-                //                io::stdout().write(&buf[0..n]).unwrap();
-                msg.extend(&buf[0..n]);
-                let mut c = Cursor::new(msg.clone());
-                match message::Message::read(&mut c) {
-                    Err(e) => {
-                        error!("cannot parse message: {}", e);
-                    },
-                    Ok(m) => {
-                        let pos = c.position();
-                        let rest = msg.split_off(pos as usize);
-                        msg = rest;
-                        sender.send(m).unwrap();
-                    }
-                }
+        match read_message(stream, msg) {
+            Ok((message, rest)) => {
+                *msg = rest;
+                sender.send(message).unwrap();
             },
             Err(e) => {
                 error!("error when reading: {}", e);
-                break;
+                return;
             }
         }
     }
@@ -380,31 +451,16 @@ fn recv_handler_loop(stream: &mut ssl::SslStream<TcpStream>,
 /// This loop repeatedly takes messages from the given Receiver,
 /// encodes them and sends them over the connection.
 fn send_handler_loop(stream: &mut ssl::SslStream<TcpStream>,
+                     _proto_version: message::Version,
                      rx: Receiver<message::Message>) {
     loop {
         match rx.recv() {
             Ok(msg) => {
-                let buf = Vec::new();
-                let mut c = Cursor::new(buf);
-                match msg.write(&mut c) {
-                    Ok(()) => {
-                        let v = c.into_inner();
-                        let n = v.len();
-                        match stream.ssl_write(&v) {
-                            Ok(x) => {
-                                if x != n {
-                                    error!("could not write everything");
-                                    return;
-                                }
-                            },
-                            Err(e) => {
-                                error!("error when writing: {}", e);
-                                return;
-                            }
-                        }
-                    },
+                match write_message(stream, msg) {
+                    Ok(()) => {},
                     Err(e) => {
-                        error!("could not serialize message: {}", e);
+                        error!("cannot write message: {}", e);
+                        return;
                     }
                 }
             },
@@ -451,6 +507,15 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
             Some(u) => {
                 info!("{} connected", u);
 
+                let (proto_version, mut msg) =
+                    match recv_negotiate_version(stream) {
+                        Ok(rest) => rest,
+                        Err(e) => {
+                            error!("cannot establish incoming connection: {}", e);
+                            return;
+                        }
+                    };
+
                 // When a previously unknown peer UUID is encountered
                 // that might become a new leader, we forget our
                 // current leader so that a new election will take
@@ -464,18 +529,21 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
 
                 {
                     let mut peers = node_state.peers.lock().unwrap();
-                    peers.entry(u)
+                    let mut pe = peers.entry(u)
                         .or_insert_with(|| PeerState{uuid: u,
+                                                     proto_version_send: None,
+                                                     proto_version_recv: None,
                                                      recv_conns: AtomicUsize::new(0),
                                                      send_conns: AtomicUsize::new(0),
                                                      connect_errors: AtomicUsize::new(0),
                                                      send_channel: None,
                                                      availability: Some(Availability::Up),
-                                                     addresses: HashSet::new()})
-                        .recv_conns.fetch_add(1, Ordering::Relaxed);
+                                                     addresses: HashSet::new()});
+                    pe.recv_conns.fetch_add(1, Ordering::Relaxed);
+                    pe.proto_version_recv = Some(proto_version);
                 }
 
-                recv_handler_loop(stream, sender);
+                recv_handler_loop(stream, &mut msg, proto_version, sender);
 
                 if let Some(cur_leader) = current_leader(node_state.clone()) {
                     if cur_leader == u {
@@ -513,6 +581,15 @@ fn send_handler(node_state: Arc<node::NodeState>,
             let (tx, rx) = sync_channel(100);
             info!("{} connected", u);
 
+            let (proto_version, _proto_version_max, _msg) =
+                match send_negotiate_version(stream) {
+                    Ok(rest) => rest,
+                    Err(e) => {
+                        error!("cannot establish incoming connection: {}", e);
+                        return;
+                    }
+                };
+
             // When a previously unknown peer UUID is encountered
             // that might become a new leader, we forget our
             // current leader so that a new election will take
@@ -543,6 +620,8 @@ fn send_handler(node_state: Arc<node::NodeState>,
                 let mut peers = node_state.peers.lock().unwrap();
                 let ps = peers.entry(u)
                     .or_insert_with(|| PeerState{uuid: u,
+                                                 proto_version_send: None,
+                                                 proto_version_recv: None,
                                                  recv_conns: AtomicUsize::new(0),
                                                  send_conns: AtomicUsize::new(0),
                                                  connect_errors: AtomicUsize::new(0),
@@ -550,13 +629,14 @@ fn send_handler(node_state: Arc<node::NodeState>,
                                                  availability: Some(Availability::Up),
                                                  addresses: HashSet::new()});
                 ps.send_conns.fetch_add(1, Ordering::Relaxed);
+                ps.proto_version_send = Some(proto_version);
                 ps.send_channel = Some(tx);
                 ps.addresses.insert(peer.to_string());
             }
 
             handshake.send(()).unwrap();
 
-            send_handler_loop(stream, rx);
+            send_handler_loop(stream, proto_version, rx);
 
             if let Some(cur_leader) = current_leader(node_state.clone()) {
                 if cur_leader == u {
@@ -623,7 +703,6 @@ fn listener(node_state: Arc<node::NodeState>, addr: String,
 /// Connect to the given address, using the context to establish a TLS
 /// connection.  Call the handler function when connected.
 fn connect_to_node(node_state: Arc<node::NodeState>, addr: &String) -> bool {
-//    trace!("connecting to {}", addr);
     match TcpStream::connect(addr.as_str()) {
         Err(e) => {
             error!("cannot connect to {}: {}", addr, e);
@@ -724,12 +803,14 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
             message::Message::Nodes(uuids) => {
                 let known_uuids = get_known_uuids(node_state.clone());
                 let cur_leader_mb = current_leader(node_state.clone());
-                    
+
                 for (u, addr) in uuids {
                     if u != self_uuid {
                         let mut peers = node_state.peers.lock().unwrap();
                         peers.entry(u)
                             .or_insert_with(|| PeerState{uuid: u,
+                                                         proto_version_send: None,
+                                                         proto_version_recv: None,
                                                          recv_conns: AtomicUsize::new(0),
                                                          send_conns: AtomicUsize::new(0),
                                                          connect_errors: AtomicUsize::new(0),
@@ -946,7 +1027,7 @@ fn chatter_loop(node_state: Arc<NodeState>) {
     let mut rng = rand::thread_rng();
 
     let mut election_counter = 0;
-    
+
     let self_uuid = node_state.config.uuid;
     loop {
         thread::sleep(time::Duration::from_millis(ITERATION_SLEEP_MS));
@@ -959,9 +1040,6 @@ fn chatter_loop(node_state: Arc<NodeState>) {
                 (Leadership::LeaderUnknown, ElectionState::NonParticipant) => {
                     if let Some(next_uuid) = get_next_uuid(node_state.clone(),
                                                            &self_uuid) {
-                        // trace!("leadership unknown, sending Election({}) to {}",
-                        //        self_uuid, next_uuid);
-                        // trace!("peers: {:?}, next: {}", uuids, next_uuid);
                         info!("leadership unknown, initiating election");
                         set_election_state(node_state.clone(),
                                            Leadership::LeaderUnknown,
