@@ -171,7 +171,7 @@ impl <'a> fmt::Display for CommandParseError<'a> {
 fn repl(config: Arc<Config>, node_state: Arc<NodeState>) {
     let prompt = config.uuid.hyphenated().to_string();
     let mut input = String::new();
-    
+
     loop {
         input.clear();
         if let Err(e) = io::stdout().write(&prompt.as_bytes()[..8]) {
@@ -192,7 +192,7 @@ fn repl(config: Arc<Config>, node_state: Arc<NodeState>) {
                     "" =>
                         continue,
                     trimmed =>
-                        match Command::parse(trimmed) { 
+                        match Command::parse(trimmed) {
                             Err(e) =>
                                 println!("Error: {}", e),
                             Ok(Command::Quit) => {
@@ -272,10 +272,10 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
 
                         if is_self {
                             t.fg(term::color::GREEN).unwrap();
-                        } 
+                        }
                         if is_leader {
                             t.attr(term::Attr::Standout(true)).unwrap();
-                        } 
+                        }
                         println!("{:2} {}{} {} {:5} {:5} {:5} {:7} {:?}",
                                  idx,
                                  if is_self { "*" } else { " " },
@@ -291,7 +291,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                                  },
                                  peer_state.addresses
                         );
-                     t.reset().unwrap();
+                        t.reset().unwrap();
                     }
                     ()
                 }
