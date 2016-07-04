@@ -88,6 +88,9 @@ pub struct PeerState {
 
     /// Cluster membership of this peer.
     pub membership: Membership,
+
+    /// Per-session token for membership management.
+    pub token: Option<message::Token>,
 }
 
 /// Whether the current node currently participates in an election
@@ -137,6 +140,12 @@ pub struct NodeState {
 
     /// Cluster membership of this node.
     pub membership: RwLock<Membership>,
+
+    /// Random token for membership management.
+    pub token: message::Token,
+
+    /// Have we received a members message yet?
+    pub members: RwLock<bool>,
 }
 
 impl NodeState {
@@ -169,6 +178,8 @@ impl NodeState {
                                | ssl::SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
                                Some(verify_client_cert));
 
+        let mut rng = rand::thread_rng();
+        
         let peers = BTreeMap::new();
         Ok(NodeState {
             config: config,
@@ -177,6 +188,8 @@ impl NodeState {
             election_state: RwLock::new((Leadership::LeaderUnknown,
                                          ElectionState::NonParticipant)),
             membership: RwLock::new(Membership::Unknown),
+            token: message::Token(rng.gen()),
+            members: RwLock::new(false),
         })
     }
 }
@@ -567,7 +580,8 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                                                      send_channel: None,
                                                      availability: Some(Availability::Up),
                                                      addresses: HashSet::new(),
-                                                     membership: Membership::Unknown});
+                                                     membership: Membership::Unknown,
+                                                     token: None});
                     pe.proto_version_recv = Some(proto_version);
                 }
 
@@ -659,7 +673,8 @@ fn send_handler(node_state: Arc<node::NodeState>,
                                                      send_channel: None,
                                                      availability: Some(Availability::Up),
                                                      addresses: HashSet::new(),
-                                                     membership: Membership::Unknown});
+                                                     membership: Membership::Unknown,
+                                                     token: None});
                     ps.proto_version_send = Some(proto_version);
                     ps.send_channel = Some(tx);
                     ps.addresses.insert(peer.to_string());
@@ -851,7 +866,8 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                                                          send_channel: None,
                                                          availability: None,
                                                          addresses: HashSet::new(),
-                                                         membership: Membership::Unknown})
+                                                         membership: Membership::Unknown,
+                            token: None})
                             .addresses.insert(addr);
                     }
 
@@ -952,6 +968,103 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                     }
                 } else {
                     error!("cannot determine next node in ring");
+                }
+            },
+            message::Message::Members(from_uuid, members) => {
+                let (ls, _) = get_election_state(node_state.clone());
+                if let Leadership::LeaderKnown(leader_uuid) = ls {
+                    if leader_uuid == from_uuid {
+                        *node_state.members.write().unwrap() = true;
+                        for (uuid, membership) in members {
+                            let transition = {
+                                if membership == Membership::Unknown {
+                                    None
+                                } else {
+                                    let mut peers = node_state.peers.lock().unwrap();
+                                    if let Some(peer) = peers.get_mut(&uuid) {
+                                        let old = peer.membership;
+                                        peer.membership = membership;
+                                        Some((old, membership))
+                                    } else {
+                                        None
+                                    }
+                                }
+                            };
+                            match transition {
+                                None => {},
+                                Some((oldms, newms)) => {
+                                    if oldms != newms {
+                                        info!("{} is now {:?} (was {:?})",
+                                              uuid, newms, oldms);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        error!("got members message from non-leader");
+                    }
+                } else if let Leadership::LeaderUnknown = ls {
+                    info!("leader is {} (from members message)", from_uuid);
+                    set_election_state(node_state.clone(),
+                                       Leadership::LeaderKnown(from_uuid),
+                                       ElectionState::NonParticipant);
+                }
+            },
+            message::Message::Join(from_uuid, token) => {
+                let (ls, _) = get_election_state(node_state.clone());
+                match ls {
+                    Leadership::SelfLeader => {
+                        let mb_msg = {
+                            let mut peers = node_state.peers.lock().unwrap();
+                            if let Some(peer) = peers.get_mut(&from_uuid) {
+                                if let Some(peer_token) = peer.token {
+                                    if peer_token == token {
+                                        peer.membership = Membership::Member;
+                                        info!("{} re-joining", from_uuid);
+                                        Some(message::Message::JoinAck(self_uuid, token))
+                                    } else {
+                                        error!("{} re-joining with different token. remove node from ring before re-starting", from_uuid);
+                                        None
+                                    }
+                                } else {
+                                    peer.membership = Membership::Member;
+                                    peer.token = Some(token);
+                                    info!("{} joining for the first time", from_uuid);
+                                    Some(message::Message::JoinAck(self_uuid, token))
+                                }
+                            } else {
+                                None
+                            }
+                        };
+                        match mb_msg {
+                            Some(msg) =>
+                                send_message(node_state.clone(), &from_uuid, msg),
+                            None =>
+                            {}
+                        };
+                    },
+                    _ => {
+                        error!("got join message without being leader");
+                    }
+                }
+            },
+            message::Message::JoinAck(from_uuid, token) => {
+                let (ls, _) = get_election_state(node_state.clone());
+                match ls {
+                    Leadership::LeaderKnown(ldr_uuid) => {
+                        if ldr_uuid == from_uuid {
+                            if token == node_state.token {
+                                *node_state.membership.write().unwrap() = Membership::Member;
+                            } else {
+                                error!("got join ack from {} with invalid token", from_uuid);
+                            }
+                        } else {
+                            error!("got join ack from {}, which is not my leader", from_uuid);
+                        }
+                    },
+                    _ => {
+                        error!("got join ack from {}, but I don't know my leader", from_uuid);
+                    }
                 }
             },
             _ => {
@@ -1081,6 +1194,32 @@ fn chatter_loop(node_state: Arc<NodeState>) {
     let self_uuid = node_state.config.uuid;
     loop {
         thread::sleep(time::Duration::from_millis(ITERATION_SLEEP_MS));
+
+        let mb_msg = {
+            let es = get_election_state(node_state.clone());
+            let ms = *node_state.membership.read().unwrap();
+            let mem_msg = *node_state.members.read().unwrap();
+            match (ms, es, mem_msg) {
+                (Membership::Unknown, (Leadership::LeaderKnown(leader_uuid), _), true) => {
+                    Some((leader_uuid,
+                          message::Message::Join(self_uuid, node_state.token),
+                          Membership::Joining))
+                },
+                _ => {
+                    None
+                },
+            }
+        };
+        match mb_msg {
+            None => {},
+            Some((to_uuid, msg, newms)) => {
+                send_message(node_state.clone(),
+                             &to_uuid,
+                             msg);
+                *node_state.membership.write().unwrap() = newms;
+            }
+        }
+        
         let mut uuids = get_peer_uuids_and_addresses(node_state.clone());
 
         if uuids.len() > 0 {
@@ -1159,12 +1298,41 @@ fn chatter_loop(node_state: Arc<NodeState>) {
                     }
                 },
                 Some(Availability::Up) => {
-                    if rng.gen::<u8>() % 100 < 10 {
-                        let node_msg = make_node_message(node_state.clone(), &uuids, &u, &self_uuid);
-                        send_message(node_state.clone(), &u, node_msg)
-                    } else {
-                        send_message(node_state.clone(), &u,
-                                     message::Message::Ping(self_uuid))
+                    let es = get_election_state(node_state.clone());
+
+                    match es {
+                        (Leadership::SelfLeader, _) => {
+                            if rng.gen::<u8>() % 100 < 20 {
+                                let members = {
+                                    let mut mem = Vec::new();
+                                    let peers = node_state.peers.lock().unwrap();
+                                    for (u, ps) in peers.iter() {
+                                        mem.push((*u, ps.membership));
+                                    };
+                                    mem.push((self_uuid,
+                                              *node_state.membership.read().unwrap()));
+                                    mem
+                                };
+                            
+                                let msg = message::Message::Members(self_uuid,
+                                                                    members);
+                                send_message(node_state.clone(),
+                                             &u,
+                                             msg);
+                            }
+                        },
+                        _ => {
+                            if rng.gen::<u8>() % 100 < 10 {
+                                let node_msg = make_node_message(node_state.clone(),
+                                                                 &uuids,
+                                                                 &u,
+                                                                 &self_uuid);
+                                send_message(node_state.clone(), &u, node_msg);
+                            } else {
+                                send_message(node_state.clone(), &u,
+                                             message::Message::Ping(self_uuid));
+                            }
+                        },
                     }
                 },
                 Some(Availability::Down) => {

@@ -43,6 +43,26 @@ impl Version {
     }
 }
 
+/// Newtype wrapper for a membership token.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Token(pub u64);
+
+impl fmt::Display for Token {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Token(v) => write!(f, "{}", v),
+        }
+    }
+}
+
+impl Token {
+    pub fn number(&self) -> u64 {
+        match *self {
+            Token(v) => v
+        }
+    }
+}
+
 /// Message type for inter-node communications.
 #[derive(Debug)]
 pub enum Message {
@@ -81,6 +101,14 @@ pub enum Message {
     /// Node membership information.  This is only sent from a leader
     /// and is discarded when received from a non-leader.
     Members(Uuid, Vec<(Uuid, node::Membership)>),
+    /// Request to join the ring.
+    Join(Uuid, Token),
+    /// Accepting a join request.
+    JoinAck(Uuid, Token),
+    /// Request to leave the ring.
+    Leave(Uuid, Token),
+    /// Accepting a leave request.
+    LeaveAck(Uuid, Token),
     /// Election message. To start an election, a node sends this
     /// message to the next one in the node ring.  The included UUID
     /// is the current leader suggestion.
@@ -179,6 +207,34 @@ impl Message {
                     members.push((uuid, membership));
                 }
                 Ok(Message::Members(from_uuid, members))
+            },
+            52 => {
+                let mut buf = [0; 16];
+                try!(r.read_exact(&mut buf));
+                let from_uuid = try!(Uuid::from_bytes(&buf));
+                let token = try!(r.read_u64::<BigEndian>());
+                Ok(Message::Join(from_uuid, Token(token)))
+            },
+            53 => {
+                let mut buf = [0; 16];
+                try!(r.read_exact(&mut buf));
+                let from_uuid = try!(Uuid::from_bytes(&buf));
+                let token = try!(r.read_u64::<BigEndian>());
+                Ok(Message::JoinAck(from_uuid, Token(token)))
+            },
+            54 => {
+                let mut buf = [0; 16];
+                try!(r.read_exact(&mut buf));
+                let from_uuid = try!(Uuid::from_bytes(&buf));
+                let token = try!(r.read_u64::<BigEndian>());
+                Ok(Message::Leave(from_uuid, Token(token)))
+            },
+            55 => {
+                let mut buf = [0; 16];
+                try!(r.read_exact(&mut buf));
+                let from_uuid = try!(Uuid::from_bytes(&buf));
+                let token = try!(r.read_u64::<BigEndian>());
+                Ok(Message::LeaveAck(from_uuid, Token(token)))
             },
             60 => {
                 let mut buf = [0; 16];
@@ -287,6 +343,38 @@ impl Message {
                         };
                     try!(w.write_u8(tag));
                 }
+                Ok(())
+            },
+            Message::Join(ref from_uuid, ref token) => {
+                try!(w.write_u8(52));
+
+                let buf = from_uuid.as_bytes();
+                try!(w.write(buf));
+                try!(w.write_u64::<BigEndian>(token.number()));
+                Ok(())
+            },
+            Message::JoinAck(ref from_uuid, ref token) => {
+                try!(w.write_u8(53));
+
+                let buf = from_uuid.as_bytes();
+                try!(w.write(buf));
+                try!(w.write_u64::<BigEndian>(token.number()));
+                Ok(())
+            },
+            Message::Leave(ref from_uuid, ref token) => {
+                try!(w.write_u8(54));
+
+                let buf = from_uuid.as_bytes();
+                try!(w.write(buf));
+                try!(w.write_u64::<BigEndian>(token.number()));
+                Ok(())
+            },
+            Message::LeaveAck(ref from_uuid, ref token) => {
+                try!(w.write_u8(55));
+
+                let buf = from_uuid.as_bytes();
+                try!(w.write(buf));
+                try!(w.write_u64::<BigEndian>(token.number()));
                 Ok(())
             },
             Message::Election(uuid) => {

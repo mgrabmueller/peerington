@@ -267,7 +267,8 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                                     send_channel: None,
                                     availability: Some(Availability::Up),
                                     addresses: self_addrs,
-                                    membership: *ms}
+                                    membership: *ms,
+                                    token: None}
                         };
                     let mut ps = Vec::new();
                     for (name, peer_state) in &*peers {
@@ -284,12 +285,25 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                         let is_self = *name == self_peer_state.uuid;
                         let is_leader = Some(*name) == current_leader(node_state.clone());
 
-                        if is_self {
-                            t.fg(term::color::GREEN).unwrap();
-                        }
-                        if is_leader {
-                            t.attr(term::Attr::Standout(true)).unwrap();
-                        }
+                        match peer_state.availability {
+                            None => {
+                                if is_leader {
+                                    t.attr(term::Attr::Standout(true)).unwrap();
+                                } else {
+                                    t.fg(term::color::BRIGHT_BLACK).unwrap();
+                                }
+                            },
+                            Some(Availability::Up) => {
+                                if is_self {
+                                    t.fg(term::color::GREEN).unwrap();
+                                }
+                                if is_leader {
+                                    t.attr(term::Attr::Standout(true)).unwrap();
+                                }
+                            },
+                            Some(Availability::Down) =>
+                                t.fg(term::color::RED).unwrap()
+                        };
                         println!("{:2} {}{} {} {:5} {:5} {:5} {:7} {:7} {:?}",
                                  idx,
                                  if is_self { "*" } else { " " },
@@ -322,8 +336,10 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         },
         Command::State => {
             let (leadership, election_state) = get_election_state(node_state.clone());
-            println!("uuid:   {}", node_state.config.uuid);
-            println!("leader: {} {}",
+            let membership = *node_state.membership.read().unwrap();
+            println!("uuid:       {}", node_state.config.uuid);
+            println!("token:      {}", node_state.token);
+            println!("leader:     {} {}",
                      match leadership {
                          Leadership::SelfLeader => format!("{}", node_state.config.uuid),
                          Leadership::LeaderKnown(u) => format!("{}", u),
@@ -333,7 +349,14 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                          ElectionState::Participant => "(election in progress)",
                          ElectionState::NonParticipant => "",
                      });
-        }
+            println!("membership: {}",
+                     match membership {
+                         Membership::Unknown => "unknown",
+                         Membership::Joining => "joining",
+                         Membership::Member => "member",
+                         Membership::Leaving => "leaving",
+                     });
+        },
         Command::Quit => {
             // Should be handled in caller.
             unreachable!();
