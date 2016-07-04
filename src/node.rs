@@ -515,11 +515,11 @@ fn get_peer_uuid(stream: &ssl::SslStream<TcpStream>) -> Option<Uuid> {
 /// taken from the peer certificate.
 fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<TcpStream>,
                 sender: SyncSender<message::Message>) {
-    if let Ok(peer) = stream.get_ref().peer_addr() {
-        info!("connection from {}", peer);
+    match stream.get_ref().peer_addr() {
+        Ok(peer) =>
         match get_peer_uuid(stream) {
             Some(u) => {
-                info!("{} connected", u);
+                info!("{}@{} connected", u, peer);
 
                 let (proto_version, mut msg) =
                     match recv_negotiate_version(stream) {
@@ -568,15 +568,15 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                         forget_leader(node_state.clone());
                     }
                 }
-                info!("{} disconnected", u);
+                info!("{}@{} disconnected", u, peer);
             }
             None => {
+                info!("connection from {}: cannot determine peer UUID", peer);
                 ()
             }
-        }
-        info!("{} disconnected", peer);
-    } else {
-        error!("cannot determine peer address, closing connection.");
+        },
+        Err(e) =>
+            error!("cannot determine peer address: {}", e)
     }
 }
 
@@ -585,88 +585,90 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
 fn send_handler(node_state: Arc<node::NodeState>,
                 stream: &mut ssl::SslStream<TcpStream>,
                 handshake: SyncSender<()>) {
-    let peer = stream.get_ref().peer_addr().unwrap();
-    info!("connected to {}", peer);
-    match get_peer_uuid(stream) {
-        None => {
-            error!("cannot determine peer UUID");
-        },
-        Some(u) => {
-            let (tx, rx) = sync_channel(100);
-            info!("{} connected", u);
+    match stream.get_ref().peer_addr() {
+        Ok(peer) =>
+        match get_peer_uuid(stream) {
+            None => {
+                error!("connection to {}: cannot determine peer UUID", peer);
+            },
+            Some(u) => {
+                let (tx, rx) = sync_channel(100);
+                info!("{}@{} connected", u, peer);
 
-            // Negotiate protocol version.
-            let (proto_version, _proto_version_max, _msg) =
-                match send_negotiate_version(stream) {
-                    Ok(rest) => rest,
-                    Err(e) => {
-                        error!("cannot establish incoming connection: {}", e);
-                        return;
+                // Negotiate protocol version.
+                let (proto_version, _proto_version_max, _msg) =
+                    match send_negotiate_version(stream) {
+                        Ok(rest) => rest,
+                        Err(e) => {
+                            error!("cannot establish incoming connection: {}", e);
+                            return;
+                        }
+                    };
+
+                // When a previously unknown peer UUID is encountered
+                // that might become a new leader, we forget our
+                // current leader so that a new election will take
+                // place.
+                if let Some(cur_leader) = current_leader(node_state.clone()) {
+                    if !is_known_uuid(node_state.clone(), &u) && u > cur_leader {
+                        trace!("connected to previously unknown leader candidate, forgetting leader");
+                        forget_leader(node_state.clone());
                     }
-                };
-
-            // When a previously unknown peer UUID is encountered
-            // that might become a new leader, we forget our
-            // current leader so that a new election will take
-            // place.
-            if let Some(cur_leader) = current_leader(node_state.clone()) {
-                if !is_known_uuid(node_state.clone(), &u) && u > cur_leader {
-                    trace!("connected to previously unknown leader candidate, forgetting leader");
-                    forget_leader(node_state.clone());
                 }
-            }
 
-            // Make sure the send_handler_loop receives the Hello
-            // message before any other message. We do this by sending
-            // before entering the sending part of the channel into
-            // the global map.
-            tx.send(message::Message::Hello(node_state.config.uuid,
-                                            node_state.config
-                                            .listen_addresses.clone())).unwrap();
+                // Make sure the send_handler_loop receives the Hello
+                // message before any other message. We do this by sending
+                // before entering the sending part of the channel into
+                // the global map.
+                tx.send(message::Message::Hello(node_state.config.uuid,
+                                                node_state.config
+                                                .listen_addresses.clone())).unwrap();
 
-            // Also, send a node message if we know about the ring.
-            let uuids = get_peer_uuids_and_addresses(node_state.clone());
-            if uuids.len() > 0 {
-                let node_msg = make_node_message(node_state.clone(), &uuids, &u, &node_state.config.uuid);
-                tx.send(node_msg).unwrap();
-            }
+                // Also, send a node message if we know about the ring.
+                let uuids = get_peer_uuids_and_addresses(node_state.clone());
+                if uuids.len() > 0 {
+                    let node_msg = make_node_message(node_state.clone(), &uuids, &u, &node_state.config.uuid);
+                    tx.send(node_msg).unwrap();
+                }
 
-            // Now that the connection was established
-            {
-                let mut peers = node_state.peers.lock().unwrap();
-                let ps = peers.entry(u)
-                    .or_insert_with(|| PeerState{uuid: u,
-                                                 proto_version_send: None,
-                                                 proto_version_recv: None,
+                // Now that the connection was established
+                {
+                    let mut peers = node_state.peers.lock().unwrap();
+                    let ps = peers.entry(u)
+                        .or_insert_with(|| PeerState{uuid: u,
+                                                     proto_version_send: None,
+                                                     proto_version_recv: None,
                                                  connect_errors: 0,
-                                                 send_channel: None,
-                                                 availability: Some(Availability::Up),
-                                                 addresses: HashSet::new()});
-                ps.proto_version_send = Some(proto_version);
-                ps.send_channel = Some(tx);
-                ps.addresses.insert(peer.to_string());
-            }
-
-            handshake.send(()).unwrap();
-
-            send_handler_loop(stream, proto_version, rx);
-
-             {
-                let mut peers = node_state.peers.lock().unwrap();
-                if let Some(ps) = peers.get_mut(&u) {
-                    ps.proto_version_send = None;
-                    ps.send_channel = None;
+                                                     send_channel: None,
+                                                     availability: Some(Availability::Up),
+                                                     addresses: HashSet::new()});
+                    ps.proto_version_send = Some(proto_version);
+                    ps.send_channel = Some(tx);
+                    ps.addresses.insert(peer.to_string());
                 }
-            }
-           if let Some(cur_leader) = current_leader(node_state.clone()) {
-                if cur_leader == u {
-                    forget_leader(node_state.clone());
+
+                handshake.send(()).unwrap();
+
+                send_handler_loop(stream, proto_version, rx);
+
+                {
+                    let mut peers = node_state.peers.lock().unwrap();
+                    if let Some(ps) = peers.get_mut(&u) {
+                        ps.proto_version_send = None;
+                        ps.send_channel = None;
+                    }
                 }
+                if let Some(cur_leader) = current_leader(node_state.clone()) {
+                    if cur_leader == u {
+                        forget_leader(node_state.clone());
+                    }
+                }
+                info!("{}@{} disconnected", u, peer);
             }
-            info!("{} connected", u);
-        }
+        },
+        Err(e) =>
+            error!("cannot determine peer address: {}", e)
     }
-    info!("{} disconnected", peer);
 }
 
 /// Bind to the given address and wait for incoming connections, using
