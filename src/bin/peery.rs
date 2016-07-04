@@ -5,9 +5,7 @@
 extern crate peerington;
 extern crate env_logger;
 extern crate uuid;
-
-use std::sync::atomic::AtomicUsize;
-use std::collections::HashSet;
+extern crate term;
 
 use peerington::config::get_config;
 use peerington::config::print_usage;
@@ -27,6 +25,8 @@ use peerington::message::Message;
 use uuid::Uuid;
 
 use std::sync::atomic::Ordering;
+use std::sync::atomic::AtomicUsize;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::env;
 use std::io;
@@ -265,17 +265,22 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                              &self_peer_state));
                     ps.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
 
+                    let mut t = term::stdout().unwrap();
+
                     for (idx, &(name, peer_state)) in ps.iter().enumerate() {
-                        let marker1 = if *name == self_peer_state.uuid {
-                            "*" } else { " " };
-                        
-                        let marker2 = if Some(*name) == current_leader(node_state.clone()) {
-                            "L" } else { " " };
-                        
+                        let is_self = *name == self_peer_state.uuid;
+                        let is_leader = Some(*name) == current_leader(node_state.clone());
+
+                        if is_self {
+                            t.fg(term::color::GREEN).unwrap();
+                        } 
+                        if is_leader {
+                            t.attr(term::Attr::Standout(true)).unwrap();
+                        } 
                         println!("{:2} {}{} {} {:5} {:5} {:5} {:7} {:?}",
                                  idx,
-                                 marker1,
-                                 marker2,
+                                 if is_self { "*" } else { " " },
+                                 if is_leader { "L" } else { " " },
                                  name,
                                  peer_state.recv_conns.load(Ordering::Relaxed),
                                  peer_state.send_conns.load(Ordering::Relaxed),
@@ -287,6 +292,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                                  },
                                  peer_state.addresses
                         );
+                     t.reset().unwrap();
                     }
                     ()
                 }
