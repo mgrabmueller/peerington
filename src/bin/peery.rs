@@ -14,6 +14,7 @@ use peerington::config::Config;
 use peerington::node::NodeState;
 use peerington::node::PeerState;
 use peerington::node::Availability;
+use peerington::node::Membership;
 use peerington::node::Leadership;
 use peerington::node::ElectionState;
 use peerington::node::start_networking;
@@ -92,6 +93,8 @@ enum Command {
     Config,
     /// Show information on all known peers.
     Peers,
+    /// Mark node as member.
+    Join,
 }
 
 impl fmt::Display for Command {
@@ -109,6 +112,8 @@ impl fmt::Display for Command {
                 write!(f, "config"),
             Command::Peers =>
                 write!(f, "peers"),
+            Command::Join =>
+                write!(f, "join"),
         }
     }
 }
@@ -140,6 +145,8 @@ impl Command {
                         Err(CommandParseError::Syntax("send UUID MSG"))
                     }
                 },
+                "join" =>
+                    Ok(Command::Join),
                 _ =>  {
                     Err(CommandParseError::UnknownCommand(tokens[0]))
                 }
@@ -226,6 +233,10 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
             send_message(node_state, &uuid, Message::Broadcast(msg));
             println!("sent.");
         },
+        Command::Join => {
+            *node_state.membership.write().unwrap() = Membership::Member;
+            println!("node is now a cluster member");
+        },
         Command::Config => {
             let config = &node_state.config;
             println!("uuid: {}", config.uuid.hyphenated());
@@ -242,19 +253,22 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         Command::Peers => {
             match node_state.peers.lock() {
                 Ok(peers) => {
-                    println!(" # SL uuid                                     ce  rver  sver state   listen");
+                    println!(" # SL uuid                                     ce rver  sver state   member  listen");
                     let mut self_addrs = HashSet::new();
                     for a in &node_state.config.listen_addresses {
                         self_addrs.insert(a.clone());
                     }
                     let self_peer_state =
-                        PeerState{uuid: node_state.config.uuid,
-                                  proto_version_send: None,
-                                  proto_version_recv: None,
-                                  connect_errors: 0,
-                                  send_channel: None,
-                                  availability: Some(Availability::Up),
-                                  addresses: self_addrs};
+                        { let ms = node_state.membership.read().unwrap();
+                          PeerState{uuid: node_state.config.uuid,
+                                    proto_version_send: None,
+                                    proto_version_recv: None,
+                                    connect_errors: 0,
+                                    send_channel: None,
+                                    availability: Some(Availability::Up),
+                                    addresses: self_addrs,
+                                    membership: *ms}
+                        };
                     let mut ps = Vec::new();
                     for (name, peer_state) in &*peers {
                         ps.push((name, peer_state));
@@ -276,7 +290,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                         if is_leader {
                             t.attr(term::Attr::Standout(true)).unwrap();
                         }
-                        println!("{:2} {}{} {} {:5} {:5} {:5} {:7} {:?}",
+                        println!("{:2} {}{} {} {:5} {:5} {:5} {:7} {:7} {:?}",
                                  idx,
                                  if is_self { "*" } else { " " },
                                  if is_leader { "L" } else { " " },
@@ -288,6 +302,12 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                                      None => "unknown",
                                      Some(Availability::Up) => "up",
                                      Some(Availability::Down) => "down",
+                                 },
+                                 match peer_state.membership {
+                                     Membership::Unknown => "unknown",
+                                     Membership::Joining => "joining",
+                                     Membership::Member  => "member",
+                                     Membership::Leaving => "leaving",
                                  },
                                  peer_state.addresses
                         );

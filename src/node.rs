@@ -36,6 +36,15 @@ use super::config;
 use super::error;
 use super::node;
 
+/// Cluster membership.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum Membership {
+    Unknown,
+    Joining,
+    Member,
+    Leaving,
+}
+
 /// Defines whether a node is considered up (available) or down
 /// (unavailable).  A node is marked as down when it is not possible
 /// to connect to the node's listen address.  Note that availability
@@ -76,6 +85,9 @@ pub struct PeerState {
 
     /// Public listen addresses of the node.
     pub addresses: HashSet<String>,
+
+    /// Cluster membership of this peer.
+    pub membership: Membership,
 }
 
 /// Whether the current node currently participates in an election
@@ -122,6 +134,9 @@ pub struct NodeState {
 
     /// State about ongoing leadership exceptions.
     pub election_state: RwLock<(Leadership, ElectionState)>,
+
+    /// Cluster membership of this node.
+    pub membership: RwLock<Membership>,
 }
 
 impl NodeState {
@@ -161,6 +176,7 @@ impl NodeState {
             peers: Mutex::new(peers),
             election_state: RwLock::new((Leadership::LeaderUnknown,
                                          ElectionState::NonParticipant)),
+            membership: RwLock::new(Membership::Unknown),
         })
     }
 }
@@ -550,7 +566,8 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                                                      connect_errors: 0,
                                                      send_channel: None,
                                                      availability: Some(Availability::Up),
-                                                     addresses: HashSet::new()});
+                                                     addresses: HashSet::new(),
+                                                     membership: Membership::Unknown});
                     pe.proto_version_recv = Some(proto_version);
                 }
 
@@ -638,10 +655,11 @@ fn send_handler(node_state: Arc<node::NodeState>,
                         .or_insert_with(|| PeerState{uuid: u,
                                                      proto_version_send: None,
                                                      proto_version_recv: None,
-                                                 connect_errors: 0,
+                                                     connect_errors: 0,
                                                      send_channel: None,
                                                      availability: Some(Availability::Up),
-                                                     addresses: HashSet::new()});
+                                                     addresses: HashSet::new(),
+                                                     membership: Membership::Unknown});
                     ps.proto_version_send = Some(proto_version);
                     ps.send_channel = Some(tx);
                     ps.addresses.insert(peer.to_string());
@@ -832,7 +850,8 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                                                          connect_errors: 0,
                                                          send_channel: None,
                                                          availability: None,
-                                                         addresses: HashSet::new()})
+                                                         addresses: HashSet::new(),
+                                                         membership: Membership::Unknown})
                             .addresses.insert(addr);
                     }
 
@@ -869,8 +888,15 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                                 set_election_state(node_state.clone(),
                                                    Leadership::LeaderUnknown,
                                                    ElectionState::Participant);
-                                send_message(node_state.clone(), &next_uuid,
-                                             message::Message::Election(self_uuid));
+                                // Only send our UUID if we are already a member.
+                                match *node_state.membership.read().unwrap() {
+                                    Membership::Member => 
+                                        send_message(node_state.clone(), &next_uuid,
+                                                     message::Message::Election(self_uuid)),
+                                    _ =>
+                                        send_message(node_state.clone(), &next_uuid,
+                                                     message::Message::Election(proposed_uuid)),
+                                }
                             },
                             ElectionState::Participant => {
                                 // trace!("already participant, dropping");
@@ -884,11 +910,19 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                             ElectionState::Participant => {
                                 // trace!("got election msg for myself, turning to leader, sending Elected({}) to {}",
                                 //        self_uuid, next_uuid);
-                                set_election_state(node_state.clone(),
-                                                   Leadership::LeaderUnknown,
-                                                   ElectionState::NonParticipant);
-                                send_message(node_state.clone(), &next_uuid,
-                                             message::Message::Elected(self_uuid));
+                                match *node_state.membership.read().unwrap() {
+                                    Membership::Member => {
+                                        set_election_state(node_state.clone(),
+                                                           Leadership::LeaderUnknown,
+                                                           ElectionState::NonParticipant);
+                                        send_message(node_state.clone(), &next_uuid,
+                                                     message::Message::Elected(self_uuid));
+                                    },
+                                    _ => {
+                                        // Drop if we are not a member anymore.
+                                        error!("got election message with own UUID, but not member - dropping");
+                                    }
+                                }
                             }
                         }
                     }
@@ -1056,38 +1090,58 @@ fn chatter_loop(node_state: Arc<NodeState>) {
                 (Leadership::LeaderUnknown, ElectionState::NonParticipant) => {
                     if let Some(next_uuid) = get_next_uuid(node_state.clone(),
                                                            &self_uuid) {
-                        info!("leadership unknown, initiating election");
-                        set_election_state(node_state.clone(),
-                                           Leadership::LeaderUnknown,
-                                           ElectionState::Participant);
-                        send_message(node_state.clone(), &next_uuid,
-                                     message::Message::Election(self_uuid));
-                    }
-                },
-                (Leadership::LeaderKnown(ldr_uuid), ElectionState::NonParticipant) => {
-                    if ldr_uuid < self_uuid {
-                        if let Some(next_uuid) = get_next_uuid(node_state.clone(),
-                                                               &self_uuid) {
-                            info!("detected invalid leader, initiating election");
-                            set_election_state(node_state.clone(),
-                                               Leadership::LeaderUnknown,
-                                               ElectionState::Participant);
-                            send_message(node_state.clone(), &next_uuid,
-                                         message::Message::Election(self_uuid));
+                        match *node_state.membership.read().unwrap() {
+                            Membership::Member => {
+                                info!("leadership unknown, initiating election");
+                                set_election_state(node_state.clone(),
+                                                   Leadership::LeaderUnknown,
+                                                   ElectionState::Participant);
+                                send_message(node_state.clone(), &next_uuid,
+                                             message::Message::Election(self_uuid));
+                            },
+                            _ =>
+                                info!("leadership unknown, but not a member"),
                         }
                     }
                 },
-                (_, ElectionState::Participant) => {
-                    election_counter += 1;
-                    if election_counter > 3 {
-                        info!("too long in election phase, restarting election process");
-                        forget_leader(node_state.clone());
-                        election_counter = 0;
+                (Leadership::LeaderKnown(ldr_uuid), ElectionState::NonParticipant) => {
+                    match *node_state.membership.read().unwrap() {
+                        Membership::Member => {
+                            if ldr_uuid < self_uuid {
+                                if let Some(next_uuid) = get_next_uuid(node_state.clone(),
+                                                                       &self_uuid) {
+                                    info!("detected invalid leader, initiating election");
+                                    set_election_state(node_state.clone(),
+                                                       Leadership::LeaderUnknown,
+                                                       ElectionState::Participant);
+                                    send_message(node_state.clone(), &next_uuid,
+                                                 message::Message::Election(self_uuid));
+                                }
+                            }
+                        },
+                        _ =>
+                        {},
                     }
                 },
-                _ => {
-                }
-
+                (_, ElectionState::Participant) => {
+                    match *node_state.membership.read().unwrap() {
+                        Membership::Member => {
+                            election_counter += 1;
+                            if election_counter > 3 {
+                                info!("too long in election phase, restarting election process");
+                                forget_leader(node_state.clone());
+                                election_counter = 0;
+                            }
+                        },
+                        _ => {
+                            set_election_state(node_state.clone(),
+                                               Leadership::LeaderUnknown,
+                                               ElectionState::NonParticipant);
+                        }
+                    }
+                },
+                _ =>
+                {},
             }
         }
 
