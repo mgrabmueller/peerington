@@ -724,48 +724,63 @@ fn send_handler(node_state: Arc<node::NodeState>,
     }
 }
 
+fn accept_loop(node_state: Arc<node::NodeState>,
+               addr: String,
+               sender: SyncSender<message::Message>,
+               listener: TcpListener) {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let ns = node_state.clone();
+                let a = addr.clone();
+                let send = sender.clone();
+                thread::spawn(move || {
+                    match ssl::Ssl::new(&ns.ssl_context) {
+                        Ok(ssl) => {
+                            match ssl::SslStream::accept(ssl, stream) {
+                                Ok(mut ssl_stream) => {
+                                    recv_handler(ns, &mut ssl_stream, send);
+                                },
+                                Err(e) => {
+                                    error!("error when accepting connection: {}",
+                                           e)
+                                }
+                            }
+                                }
+                        Err(e) => {
+                            error!("error when accepting connection to {}: {}",
+                                   a, e)
+                        }
+                    }
+                });
+                ()
+            },
+            Err(e) =>
+                error!("error when accepting connection to {}: {}",
+                       addr, e)
+        }
+        if !networking_enabled(node_state.clone()) {
+            break;
+        }
+    }
+}
+
 /// Bind to the given address and wait for incoming connections, using
 /// the context to establish TLS connections.  Call the handler
 /// function for each connection.
-fn listener(node_state: Arc<node::NodeState>, addr: String,
+fn listener(node_state: Arc<node::NodeState>,
+            addr: String,
             sender: SyncSender<message::Message>) {
     match TcpListener::bind(addr.as_str()) {
         Ok(listener) => {
-            info!("listening on {}", listener.local_addr().unwrap());
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        let ns = node_state.clone();
-                        let a = addr.clone();
-                        let send = sender.clone();
-                        thread::spawn(move || {
-                            match ssl::Ssl::new(&ns.ssl_context) {
-                                Ok(ssl) => {
-                                    match ssl::SslStream::accept(ssl, stream) {
-                                        Ok(mut ssl_stream) => {
-                                            recv_handler(ns, &mut ssl_stream, send);
-                                        },
-                                        Err(e) => {
-                                            error!("error when accepting connection: {}",
-                                                   e)
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("error when accepting connection to {}: {}",
-                                           a, e)
-                                }
-                            }
-                        });
-                        ()
-                    },
-                    Err(e) =>
-                        error!("error when accepting connection to {}: {}",
-                                 addr, e)
-                }
-                if !networking_enabled(node_state.clone()) {
-                    break;
-                }
+            match listener.local_addr() {
+                Ok(local_addr) => {
+                    info!("listening on {}", local_addr);
+                    accept_loop(node_state, addr, sender, listener);
+                    info!("stopped listening on {}", local_addr);
+                },
+                Err(e) =>
+                    error!("cannot determine local listener address: {}", e),
             }
         },
         Err(e) => {
