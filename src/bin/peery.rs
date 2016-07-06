@@ -14,7 +14,6 @@ use peerington::config::Config;
 use peerington::node::NodeState;
 use peerington::node::PeerState;
 use peerington::node::Availability;
-use peerington::node::Membership;
 use peerington::node::Leadership;
 use peerington::node::ElectionState;
 use peerington::node::start_networking;
@@ -34,6 +33,8 @@ use std::env;
 use std::io;
 use std::io::Write;
 use std::fmt;
+use std::fs::{DirBuilder,remove_dir};
+use std::path::Path;
 
 fn main() {
     env_logger::init().unwrap();
@@ -69,15 +70,31 @@ fn handler(msg: Message) {
 
 fn run(config: Config) {
     let conf = Arc::new(config);
-    match NodeState::new(conf.clone()) {
-        Ok(node_state) => {
-            let ns = Arc::new(node_state);
-            start_networking(ns.clone(), handler);
-            repl(conf, ns);
-            ()
+    let lock_dir_path = Path::new(&conf.workspace_dir).join("lock");
+    match DirBuilder::new().create(&lock_dir_path) {
+        Ok(()) => {
+            match NodeState::new(conf.clone()) {
+                Ok(node_state) => {
+                    let ns = Arc::new(node_state);
+                    start_networking(ns.clone(), handler);
+                    repl(conf, ns);
+                    ()
+                },
+                Err(e) =>
+                    println!("cannot create node state: {}", e)
+            }
+            match remove_dir(&lock_dir_path) {
+                Ok(()) => {},
+                Err(e) => {
+                    println!("could not remove lock directory `{:?}': {}", lock_dir_path, e);
+                }
+            }
         },
-        Err(e) =>
-            println!("cannot create node state: {}", e)
+        Err(e) => {
+            println!("Could not create lock directory: {}", e);
+            println!("Maybe an instance is already running?");
+            println!("If not, remove `{:?}' and try again.", lock_dir_path);
+        }
     }
 }
 
@@ -95,8 +112,6 @@ enum Command {
     Config,
     /// Show information on all known peers.
     Peers,
-    /// Mark node as member.
-    Join,
     /// Switch on/off networking.
     Network(bool),
 }
@@ -116,8 +131,6 @@ impl fmt::Display for Command {
                 write!(f, "config"),
             Command::Peers =>
                 write!(f, "peers"),
-            Command::Join =>
-                write!(f, "join"),
             Command::Network(on) =>
                 write!(f, "network {}", if on { "on" } else { "off" }),
         }
@@ -151,8 +164,6 @@ impl Command {
                         Err(CommandParseError::Syntax("send UUID MSG"))
                     }
                 },
-                "join" =>
-                    Ok(Command::Join),
                 "network" => {
                     if tokens.len() == 2 {
                         match tokens[1] {
@@ -247,17 +258,12 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
             println!("  peers             display the node ring");
             println!("  config            display the node configuration");
             println!("  state             display the state of this node");
-            println!("  join              mark this node as a ring member");
             println!("  network on|off    enable/disable networking on this node");
         },
         Command::Send(uuid, msg) => {
             println!("sending...");
             send_message(node_state, &uuid, Message::Broadcast(msg));
             println!("sent.");
-        },
-        Command::Join => {
-            *node_state.membership.write().unwrap() = Membership::Member;
-            println!("node is now a cluster member");
         },
         Command::Config => {
             let config = &node_state.config;
@@ -275,22 +281,20 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         Command::Peers => {
             match node_state.peers.lock() {
                 Ok(peers) => {
-                    println!(" # SL uuid                                     ce rver  sver state   member  listen");
+                    println!(" # SL uuid                                     ce rver  sver state   listen");
                     let mut self_addrs = HashSet::new();
                     for a in &node_state.config.listen_addresses {
                         self_addrs.insert(a.clone());
                     }
                     let self_peer_state =
-                        { let ms = node_state.membership.read().unwrap();
-                          PeerState{uuid: node_state.config.uuid,
+                        { PeerState{uuid: node_state.config.uuid,
                                     proto_version_send: None,
                                     proto_version_recv: None,
                                     connect_errors: 0,
                                     send_channel: None,
                                     availability: Some(Availability::Up),
                                     addresses: self_addrs,
-                                    membership: *ms,
-                                    token: None}
+                                    }
                         };
                     let mut ps = Vec::new();
                     for (name, peer_state) in &*peers {
@@ -326,7 +330,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                             Some(Availability::Down) =>
                                 t.fg(term::color::RED).unwrap()
                         };
-                        println!("{:2} {}{} {} {:5} {:5} {:5} {:7} {:7} {:?}",
+                        println!("{:2} {}{} {} {:5} {:5} {:5} {:7} {:?}",
                                  idx,
                                  if is_self { "*" } else { " " },
                                  if is_leader { "L" } else { " " },
@@ -338,12 +342,6 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                                      None => "unknown",
                                      Some(Availability::Up) => "up",
                                      Some(Availability::Down) => "down",
-                                 },
-                                 match peer_state.membership {
-                                     Membership::Unknown => "unknown",
-                                     Membership::Joining => "joining",
-                                     Membership::Member  => "member",
-                                     Membership::Leaving => "leaving",
                                  },
                                  peer_state.addresses
                         );
@@ -358,9 +356,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         },
         Command::State => {
             let (leadership, election_state) = get_election_state(node_state.clone());
-            let membership = *node_state.membership.read().unwrap();
             println!("uuid:       {}", node_state.config.uuid);
-            println!("token:      {}", node_state.token);
             println!("networking: {}",
                      if networking_enabled(node_state.clone()) {
                          "on"
@@ -376,13 +372,6 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                      match election_state {
                          ElectionState::Participant => "(election in progress)",
                          ElectionState::NonParticipant => "",
-                     });
-            println!("membership: {}",
-                     match membership {
-                         Membership::Unknown => "unknown",
-                         Membership::Joining => "joining",
-                         Membership::Member => "member",
-                         Membership::Leaving => "leaving",
                      });
         },
         Command::Network(on) => {

@@ -98,17 +98,6 @@ pub enum Message {
     /// the sending node.  Each entry is a tuple of the known node's
     /// UUID and one listening address.
     Nodes(Vec<(Uuid, String)>),
-    /// Node membership information.  This is only sent from a leader
-    /// and is discarded when received from a non-leader.
-    Members(Uuid, Vec<(Uuid, node::Membership)>),
-    /// Request to join the ring.
-    Join(Uuid, Token),
-    /// Accepting a join request.
-    JoinAck(Uuid, Token),
-    /// Request to leave the ring.
-    Leave(Uuid, Token),
-    /// Accepting a leave request.
-    LeaveAck(Uuid, Token),
     /// Election message. To start an election, a node sends this
     /// message to the next one in the node ring.  The included UUID
     /// is the current leader suggestion.
@@ -186,55 +175,6 @@ impl Message {
                     uuids.push((uuid, addr));
                 }
                 Ok(Message::Nodes(uuids))
-            },
-            51 => {
-                let mut buf = [0; 16];
-                try!(r.read_exact(&mut buf));
-                let from_uuid = try!(Uuid::from_bytes(&buf));
-
-                let uuid_count = try!(r.read_u16::<BigEndian>());
-                let mut members = Vec::new();
-                for _ in 0..uuid_count {
-                    try!(r.read_exact(&mut buf));
-                    let uuid = try!(Uuid::from_bytes(&buf));
-                    let membership = match try!(r.read_u8()) {
-                        0 => node::Membership::Unknown,
-                        1 => node::Membership::Joining,
-                        2 => node::Membership::Member,
-                        3 => node::Membership::Leaving,
-                        _ => return Err(error::Error::MessageParse("invalid membership tag")),
-                    };
-                    members.push((uuid, membership));
-                }
-                Ok(Message::Members(from_uuid, members))
-            },
-            52 => {
-                let mut buf = [0; 16];
-                try!(r.read_exact(&mut buf));
-                let from_uuid = try!(Uuid::from_bytes(&buf));
-                let token = try!(r.read_u64::<BigEndian>());
-                Ok(Message::Join(from_uuid, Token(token)))
-            },
-            53 => {
-                let mut buf = [0; 16];
-                try!(r.read_exact(&mut buf));
-                let from_uuid = try!(Uuid::from_bytes(&buf));
-                let token = try!(r.read_u64::<BigEndian>());
-                Ok(Message::JoinAck(from_uuid, Token(token)))
-            },
-            54 => {
-                let mut buf = [0; 16];
-                try!(r.read_exact(&mut buf));
-                let from_uuid = try!(Uuid::from_bytes(&buf));
-                let token = try!(r.read_u64::<BigEndian>());
-                Ok(Message::Leave(from_uuid, Token(token)))
-            },
-            55 => {
-                let mut buf = [0; 16];
-                try!(r.read_exact(&mut buf));
-                let from_uuid = try!(Uuid::from_bytes(&buf));
-                let token = try!(r.read_u64::<BigEndian>());
-                Ok(Message::LeaveAck(from_uuid, Token(token)))
             },
             60 => {
                 let mut buf = [0; 16];
@@ -320,61 +260,6 @@ impl Message {
                     try!(w.write_u16::<BigEndian>(addr.len() as u16));
                     try!(w.write(addr.as_bytes()));
                 }
-                Ok(())
-            },
-            Message::Members(ref from_uuid, ref members) => {
-                try!(w.write_u8(51));
-
-                let buf = from_uuid.as_bytes();
-                try!(w.write(buf));
-
-                assert!(members.len() <= (u16::MAX as usize));
-                try!(w.write_u16::<BigEndian>(members.len() as u16));
-                for i in 0..members.len() {
-                    let (ref uuid, membership) = members[i];
-                    let buf = uuid.as_bytes();
-                    try!(w.write(buf));
-                    let tag =
-                        match membership {
-                            node::Membership::Unknown => 0,
-                            node::Membership::Joining => 1,
-                            node::Membership::Member  => 2,
-                            node::Membership::Leaving => 3,
-                        };
-                    try!(w.write_u8(tag));
-                }
-                Ok(())
-            },
-            Message::Join(ref from_uuid, ref token) => {
-                try!(w.write_u8(52));
-
-                let buf = from_uuid.as_bytes();
-                try!(w.write(buf));
-                try!(w.write_u64::<BigEndian>(token.number()));
-                Ok(())
-            },
-            Message::JoinAck(ref from_uuid, ref token) => {
-                try!(w.write_u8(53));
-
-                let buf = from_uuid.as_bytes();
-                try!(w.write(buf));
-                try!(w.write_u64::<BigEndian>(token.number()));
-                Ok(())
-            },
-            Message::Leave(ref from_uuid, ref token) => {
-                try!(w.write_u8(54));
-
-                let buf = from_uuid.as_bytes();
-                try!(w.write(buf));
-                try!(w.write_u64::<BigEndian>(token.number()));
-                Ok(())
-            },
-            Message::LeaveAck(ref from_uuid, ref token) => {
-                try!(w.write_u8(55));
-
-                let buf = from_uuid.as_bytes();
-                try!(w.write(buf));
-                try!(w.write_u64::<BigEndian>(token.number()));
                 Ok(())
             },
             Message::Election(uuid) => {
