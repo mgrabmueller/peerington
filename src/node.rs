@@ -285,7 +285,7 @@ fn verify_client_cert(preverify_ok: bool, x509_ctx: &x509::X509StoreContext) -> 
 pub fn send_message(node_state: Arc<node::NodeState>,
                     to: &Uuid,
                     message: message::Message) {
-//    trace!("sending to {}: {:?}", to, message);
+    trace!("sending to {}: {:?}", to, message);
     let tx = node::find_send_channel(node_state.clone(), to);
     match tx {
         Some(tx) => {
@@ -834,7 +834,19 @@ fn make_node_message(node_state: Arc<NodeState>,
         .collect();
     us.push((*self_uuid,
              node_state.config.listen_addresses[0].clone()));
-    message::Message::Nodes(us)
+    let leader = {
+        let (ls, _) = get_election_state(node_state.clone());
+        match ls {
+            Leadership::SelfLeader =>
+                Some(node_state.config.uuid),
+            Leadership::LeaderKnown(u) =>
+                Some(u),
+            Leadership::LeaderUnknown =>
+                None,
+        }
+    };
+
+    message::Message::Nodes(leader, us)
 }
 
 pub fn networking_enabled(node_state: Arc<NodeState>) -> bool {
@@ -875,7 +887,7 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
             message::Message::Pong(_u) => {
                 // Do nothing for now.
             },
-            message::Message::Nodes(uuids) => {
+            message::Message::Nodes(mb_ldr, uuids) => {
                 let known_uuids = get_known_uuids(node_state.clone());
                 let cur_leader_mb = current_leader(node_state.clone());
 
@@ -899,9 +911,21 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                     // current leader so that a new election will take
                     // place.
                     if let Some(cur_leader) = cur_leader_mb {
+                        if let Some(ldr) = mb_ldr {
+                            if cur_leader != ldr {
+                                info!("leader in message different from current leader");
+                                forget_leader(node_state.clone());
+                            }
+                        }
                         if !known_uuids.contains(&u) && u > cur_leader {
                             info!("learned about previously unknown leader candidate");
                             forget_leader(node_state.clone());
+                        }
+                    } if let Some(ldr) = mb_ldr {
+                        if ldr != self_uuid {
+                            set_election_state(node_state.clone(),
+                                               Leadership::LeaderKnown(ldr),
+                                               ElectionState::NonParticipant);
                         }
                     }
                 }
@@ -962,12 +986,12 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                                                        &self_uuid) {
                     if self_uuid == elected_uuid {
                         // trace!("got elected msg for myself, becoming leader, stopping election");
-                        info!("got elected as new leader");
+                        info!("got elected as leader");
                         set_election_state(node_state.clone(), Leadership::SelfLeader,
                                            ElectionState::NonParticipant);
                     } else {
                         // trace!("got elected msg for other node, recording as leader");
-                        info!("new leader elected: {}", elected_uuid);
+                        info!("leader elected: {}", elected_uuid);
                         set_election_state(node_state.clone(),
                                            Leadership::LeaderKnown(elected_uuid),
                                            ElectionState::NonParticipant);
@@ -1152,7 +1176,7 @@ fn chatter_loop(node_state: Arc<NodeState>) {
                 },
                 (_, ElectionState::Participant) => {
                     election_counter += 1;
-                    if election_counter > 3 {
+                    if election_counter > 3 + (rng.gen::<u8>() % 5) {
                         info!("too long in election phase, restarting election process");
                         forget_leader(node_state.clone());
                         election_counter = 0;
@@ -1163,15 +1187,43 @@ fn chatter_loop(node_state: Arc<NodeState>) {
             }
         }
 
-        rng.shuffle(uuids.as_mut_slice());
-        for &(u, _) in uuids.iter().take(2) {
+        // Periodically, ping the current leader (if there is one).
+        let mb_ldr = {
+            let (ls, _) = get_election_state(node_state.clone());
+            
+            match ls {
+                Leadership::LeaderUnknown => None,
+                Leadership::LeaderKnown(ldr_uuid) => Some(ldr_uuid),
+                Leadership::SelfLeader => None,
+            }
+        };
+        if let Some(ldr_uuid) = mb_ldr {
+            if rng.gen::<u8>() % 100 < 50 {
+                send_message(node_state.clone(), &ldr_uuid,
+                             message::Message::Ping(self_uuid))
+            }
+        }
+
+        // FIXME: Need to periodically try to reconnect to down nodes.
+            
+        // Periodically, ping the node next in the ring.
+        let mut nuuids = Vec::new();
+        match get_next_uuid(node_state.clone(), &self_uuid) {
+            None => {},
+            Some(next_uuid) => {
+                nuuids.push(next_uuid);
+            }
+        }
+        rng.shuffle(nuuids.as_mut_slice());
+//        for &(u, _) in uuids.iter().take(2) {
+        for &u in nuuids.iter().take(2) {
             let availability = {
                 let peers = node_state.peers.lock().unwrap();
                 peers.get(&u).and_then(|peer| peer.availability)
             };
             match availability {
                 None => {
-                    if rng.gen::<u8>() % 100 < 10 {
+                    if rng.gen::<u8>() % 100 < 50 {
                         send_message(node_state.clone(), &u,
                                      message::Message::Ping(self_uuid))
                     }

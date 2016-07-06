@@ -93,10 +93,10 @@ pub enum Message {
     Pong(Uuid),
     /// Node information message. This is sent on connection
     /// establishment (both by the connecting and the accepting node)
-    /// and periodically.  It contains a list of all nodes known to
-    /// the sending node.  Each entry is a tuple of the known node's
-    /// UUID and one listening address.
-    Nodes(Vec<(Uuid, String)>),
+    /// and periodically.  It contains the current leader (if known)
+    /// adn a list of all nodes known to the sending node.  Each entry
+    /// is a tuple of the known node's UUID and one listening address.
+    Nodes(Option<Uuid>, Vec<(Uuid, String)>),
     /// Election message. To start an election, a node sends this
     /// message to the next one in the node ring.  The included UUID
     /// is the current leader suggestion.
@@ -161,10 +161,22 @@ impl Message {
                 Ok(Message::Pong(uuid))
             },
             50 => {
+                let mut buf = [0; 16];
+                let ldr_tag = try!(r.read_u8());
+                let ldr =
+                    match ldr_tag {
+                        0 => None,
+                        1 =>  {
+                            try!(r.read_exact(&mut buf));
+                            let uuid = try!(Uuid::from_bytes(&buf));
+                            Some(uuid)
+                        },
+                        _ =>
+                            return Err(error::Error::MessageParse("invalid option tag")),
+                    };
                 let uuid_count = try!(r.read_u16::<BigEndian>());
                 let mut uuids = Vec::new();
                 for _ in 0..uuid_count {
-                    let mut buf = [0; 16];
                     try!(r.read_exact(&mut buf));
                     let uuid = try!(Uuid::from_bytes(&buf));
                     let addr_len = try!(r.read_u16::<BigEndian>());
@@ -173,7 +185,7 @@ impl Message {
                     let addr = try!(String::from_utf8(v));
                     uuids.push((uuid, addr));
                 }
-                Ok(Message::Nodes(uuids))
+                Ok(Message::Nodes(ldr, uuids))
             },
             60 => {
                 let mut buf = [0; 16];
@@ -246,9 +258,17 @@ impl Message {
                 try!(w.write(buf));
                 Ok(())
             },
-            Message::Nodes(ref uuids) => {
+            Message::Nodes(ref mb_ldr, ref uuids) => {
                 try!(w.write_u8(50));
 
+                match mb_ldr {
+                    &None => try!(w.write_u8(0)),
+                    &Some(u) => {
+                        try!(w.write_u8(1));
+                        let buf = u.as_bytes();
+                        try!(w.write(buf));
+                    }
+                };
                 assert!(uuids.len() <= (u16::MAX as usize));
                 try!(w.write_u16::<BigEndian>(uuids.len() as u16));
                 for i in 0..uuids.len() {

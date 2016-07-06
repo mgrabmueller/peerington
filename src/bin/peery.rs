@@ -312,15 +312,15 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
 
                         match peer_state.availability {
                             None => {
+                                t.fg(term::color::BRIGHT_BLACK).unwrap();
                                 if is_leader {
                                     t.attr(term::Attr::Standout(true)).unwrap();
-                                } else {
-                                    t.fg(term::color::BRIGHT_BLACK).unwrap();
                                 }
                             },
                             Some(Availability::Up) => {
+                                t.fg(term::color::GREEN).unwrap();
                                 if is_self {
-                                    t.fg(term::color::GREEN).unwrap();
+                                    t.attr(term::Attr::Underline(true)).unwrap();
                                 }
                                 if is_leader {
                                     t.attr(term::Attr::Standout(true)).unwrap();
