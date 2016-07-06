@@ -13,7 +13,6 @@ use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
 
 use super::error;
-use super::node;
 
 /// Maximum supported inter-node protocol version that this version of
 /// the library supports.

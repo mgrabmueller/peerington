@@ -186,7 +186,7 @@ pub fn remove_send_channel(node_state: Arc<node::NodeState>,
             oe.get_mut().send_channel = None;
         },
         Entry::Vacant(_) => {
-            error!("MSG: cannot remove send channel for {}, does not exist", to);
+            error!("cannot remove send channel for {}, does not exist", to);
         }
     }
 }
@@ -293,7 +293,7 @@ pub fn send_message(node_state: Arc<node::NodeState>,
                 Ok(()) =>
                     (),
                 Err(e) => {
-                    error!("MSG: could not send internal message to {}: {}", to, e);
+                    trace!("could not send internal message to {}: {}", to, e);
                     remove_send_channel(node_state, to);
                 }
             };
@@ -308,7 +308,10 @@ pub fn send_message(node_state: Arc<node::NodeState>,
                                 let mut peers = node_state.peers.lock().unwrap();
                                 let mut peer = peers.get_mut(&to).unwrap();
                                 peer.connect_errors = 0;
-                                peer.availability = Some(Availability::Up);
+                                if peer.availability != Some(Availability::Up) {
+                                    info!("node {} is up", to);
+                                    peer.availability = Some(Availability::Up);
+                                }
                             }
                             let tx = node::find_send_channel(node_state, to);
                             match tx {
@@ -317,7 +320,7 @@ pub fn send_message(node_state: Arc<node::NodeState>,
                                         &format!("could not send internal message to {}", to))
                                 },
                                 None => {
-                                    error!("MSG: could not connect to node: {}", to);
+                                    trace!("could not connect to node: {}", to);
                                 }
                             }
                         } else {
@@ -326,18 +329,21 @@ pub fn send_message(node_state: Arc<node::NodeState>,
                                 match peers.get_mut(&to) {
                                     Some(peer) => {
                                         peer.connect_errors += 1;
-                                        peer.availability = Some(Availability::Down);
+                                        if peer.availability != Some(Availability::Down) {
+                                            peer.availability = Some(Availability::Down);
+                                            info!("node {} is down", to);
+                                        }
                                     },
                                     None => {}
                                 }
                             }
                         }
                     } else {
-                        error!("MSG: no address known for node: {}", to);
+                        error!("no address known for node: {}", to);
                     }
                 },
                 None => {
-                    error!("MSG: send to unknown node: {}", to);
+                    error!("send to unknown node: {}", to);
                 }
             }
         }
@@ -406,7 +412,7 @@ fn recv_negotiate_version(stream: &mut ssl::SslStream<TcpStream>) ->
     let (version_offered_min, version_offered_max, rest) = try!(read_handshake(stream));
 
     if version_offered_min > message::MAX_SUPPORTED_VERSION {
-        error!("MSG: version in connection attempt unsupported (too high), closing connection");
+        error!("version in connection attempt unsupported (too high), closing connection");
         try!(write_message(stream, message::Message::HandshakeNak(message::MIN_SUPPORTED_VERSION,
                                                                    message::MAX_SUPPORTED_VERSION)));
         Err(error::Error::Other("connecting version not supported (too high)"))
@@ -460,12 +466,12 @@ fn recv_handler_loop(node_state: Arc<NodeState>,
                 match sender.send(message) {
                     Ok(()) => {},
                     Err(e) => {
-                        error!("MSG: error when writing to internal channel: {}", e)
+                        trace!("error when writing to internal channel: {}", e)
                     }
                 }
             },
             Err(e) => {
-                error!("MSG: error when reading: {}", e);
+                trace!("error when reading: {}", e);
                 return;
             }
         }
@@ -484,13 +490,13 @@ fn send_handler_loop(node_state: Arc<NodeState>,
                 match write_message(stream, msg) {
                     Ok(()) => {},
                     Err(e) => {
-                        error!("MSG: cannot write message: {}", e);
+                        trace!("cannot write message: {}", e);
                         return;
                     }
                 }
             },
             Err(e) => {
-                error!("MSG: error receiving internal message: {}", e);
+                trace!("error receiving internal message: {}", e);
                 return;
             }
         }
@@ -530,13 +536,13 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
         Ok(peer) =>
         match get_peer_uuid(stream) {
             Some(u) => {
-                info!("CONNECT: {}@{}", u, peer);
+                trace!("{} ({}) connected", u, peer);
 
                 let (proto_version, mut msg) =
                     match recv_negotiate_version(stream) {
                         Ok(rest) => rest,
                         Err(e) => {
-                            error!("CONNECT: cannot establish incoming connection: {}", e);
+                            error!("cannot establish incoming connection: {}", e);
                             return;
                         }
                     };
@@ -547,7 +553,7 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                 // place.
                 if let Some(cur_leader) = current_leader(node_state.clone()) {
                     if !is_known_uuid(node_state.clone(), &u) && u > cur_leader {
-                        trace!("CONNECT: previously unknown leader candidate connected, forgetting leader");
+                        info!("previously unknown leader candidate connected");
                         forget_leader(node_state.clone());
                     }
                 }
@@ -560,11 +566,14 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                                                      proto_version_recv: None,
                                                      connect_errors: 0,
                                                      send_channel: None,
-                                                     availability: Some(Availability::Up),
+                                                     availability: None,
                                                      addresses: HashSet::new(),
                                                      });
                     pe.proto_version_recv = Some(proto_version);
-                    pe.availability = Some(Availability::Up);
+                    if pe.availability != Some(Availability::Up) {
+                        pe.availability = Some(Availability::Up);
+                        info!("node {} is up", u);
+                    }
                 }
 
                 recv_handler_loop(node_state.clone(), stream, &mut msg, proto_version, sender);
@@ -578,18 +587,19 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
 
                 if let Some(cur_leader) = current_leader(node_state.clone()) {
                     if cur_leader == u {
+                        info!("current leader disconnected");
                         forget_leader(node_state.clone());
                     }
                 }
-                info!("DISCONNECT: {}@{}", u, peer);
+                trace!("{} ({}) disconnected", u, peer);
             }
             None => {
-                info!("CONNECT: from {}: cannot determine peer UUID", peer);
+                error!("cannot determine peer UUID from {}", peer);
                 ()
             }
         },
         Err(e) =>
-            error!("CONNECT: cannot determine peer address: {}", e)
+            error!("cannot determine peer address: {}", e)
     }
 }
 
@@ -602,18 +612,18 @@ fn send_handler(node_state: Arc<node::NodeState>,
         Ok(peer) =>
         match get_peer_uuid(stream) {
             None => {
-                error!("CONNECT: connection to {}: cannot determine peer UUID", peer);
+                error!("cannot determine peer UUID for connection to {}", peer);
             },
             Some(u) => {
                 let (tx, rx) = sync_channel(100);
-                info!("CONNECT: {}@{}", u, peer);
+                trace!("{} ({}) connected", u, peer);
 
                 // Negotiate protocol version.
                 let (proto_version, _proto_version_max, _msg) =
                     match send_negotiate_version(stream) {
                         Ok(rest) => rest,
                         Err(e) => {
-                            error!("CONNECT: cannot establish incoming connection: {}", e);
+                            error!("cannot establish incoming connection: {}", e);
                             return;
                         }
                     };
@@ -624,7 +634,7 @@ fn send_handler(node_state: Arc<node::NodeState>,
                 // place.
                 if let Some(cur_leader) = current_leader(node_state.clone()) {
                     if !is_known_uuid(node_state.clone(), &u) && u > cur_leader {
-                        trace!("connected to previously unknown leader candidate, forgetting leader");
+                        info!("connected to previously unknown leader candidate");
                         forget_leader(node_state.clone());
                     }
                 }
@@ -653,11 +663,14 @@ fn send_handler(node_state: Arc<node::NodeState>,
                                                      proto_version_recv: None,
                                                      connect_errors: 0,
                                                      send_channel: None,
-                                                     availability: Some(Availability::Up),
+                                                     availability: None,
                                                      addresses: HashSet::new(),
                                                      });
                     ps.proto_version_send = Some(proto_version);
-                    ps.availability = Some(Availability::Up);
+                    if ps.availability != Some(Availability::Up) {
+                        ps.availability = Some(Availability::Up);
+                        info!("node {} is up", u);
+                    }
                     ps.send_channel = Some(tx);
                     ps.addresses.insert(peer.to_string());
                 }
@@ -675,14 +688,15 @@ fn send_handler(node_state: Arc<node::NodeState>,
                 }
                 if let Some(cur_leader) = current_leader(node_state.clone()) {
                     if cur_leader == u {
+                        info!("current leader disconnected");
                         forget_leader(node_state.clone());
                     }
                 }
-                info!("DISCONNECT: {}@{}", u, peer);
+                trace!("{} ({}) disconnected", u, peer);
             }
         },
         Err(e) =>
-            error!("CONNECT: cannot determine peer address: {}", e)
+            error!("cannot determine peer address: {}", e)
     }
 }
 
@@ -707,8 +721,8 @@ fn accept_loop(node_state: Arc<node::NodeState>,
                                     recv_handler(ns, &mut ssl_stream, send);
                                 },
                                 Err(e) => {
-                                    error!("ACCEPT: error when accepting connection: {}",
-                                           e)
+                                    error!("ACCEPT: error when accepting connection to {}: {}",
+                                           a, e)
                                 }
                             }
                                 }
@@ -757,19 +771,19 @@ fn connect_to_node(node_state: Arc<node::NodeState>, addr: &String) -> bool {
     if networking_enabled(node_state.clone()) {
         match TcpStream::connect(addr.as_str()) {
             Err(e) => {
-                error!("CONNECT: cannot connect to {}: {}", addr, e);
+                trace!("cannot connect to {}: {}", addr, e);
                 false
             },
             Ok(stream) => {
                 match ssl::Ssl::new(&node_state.ssl_context) {
                     Err(e) => {
-                        error!("CONNECT: cannot create ssl context: {}", e);
+                        error!("cannot create ssl context: {}", e);
                         false
                     },
                     Ok(ssl) => {
                         match ssl::SslStream::connect(ssl, stream) {
                             Err(e) => {
-                                error!("CONNECT: cannot establish ssl connection: {}", e);
+                                error!("cannot establish ssl connection: {}", e);
                                 false
                             },
                             Ok(mut ssl_stream) => {
@@ -886,7 +900,7 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                     // place.
                     if let Some(cur_leader) = cur_leader_mb {
                         if !known_uuids.contains(&u) && u > cur_leader {
-                            trace!("learned about previously unknown leader candidate, forgetting leader");
+                            info!("learned about previously unknown leader candidate");
                             forget_leader(node_state.clone());
                         }
                     }
@@ -923,7 +937,7 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                     } else /* proposed_uuid == self_uuid */ {
                         match election_state {
                             ElectionState::NonParticipant => {
-                                error!("ELECTION: got election message with own UUID, but not participant - dropping");
+                                info!("got election message with own UUID, but not participant - dropping");
                             },
                             ElectionState::Participant => {
                                 // trace!("got election msg for myself, turning to leader, sending Elected({}) to {}",
@@ -937,7 +951,7 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                         }
                     }
                 } else {
-                    error!("ELECTION: cannot determine next node in ring");
+                    error!("cannot determine next node in ring");
                 }
             },
 
@@ -948,12 +962,12 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                                                        &self_uuid) {
                     if self_uuid == elected_uuid {
                         // trace!("got elected msg for myself, becoming leader, stopping election");
-                        info!("ELECTION: got elected as new leader");
+                        info!("got elected as new leader");
                         set_election_state(node_state.clone(), Leadership::SelfLeader,
                                            ElectionState::NonParticipant);
                     } else {
                         // trace!("got elected msg for other node, recording as leader");
-                        info!("ELECTION: new leader elected: {}", elected_uuid);
+                        info!("new leader elected: {}", elected_uuid);
                         set_election_state(node_state.clone(),
                                            Leadership::LeaderKnown(elected_uuid),
                                            ElectionState::NonParticipant);
@@ -961,7 +975,7 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                                      message::Message::Elected(elected_uuid));
                     }
                 } else {
-                    error!("ELECTION: cannot determine next node in ring");
+                    error!("cannot determine next node in ring");
                 }
             },
             _ => {
@@ -1115,7 +1129,7 @@ fn chatter_loop(node_state: Arc<NodeState>) {
                 (Leadership::LeaderUnknown, ElectionState::NonParticipant) => {
                     if let Some(next_uuid) = get_next_uuid(node_state.clone(),
                                                            &self_uuid) {
-                        info!("ELECTION: leadership unknown, initiating election");
+                        info!("leadership unknown, initiating election");
                         set_election_state(node_state.clone(),
                                            Leadership::LeaderUnknown,
                                            ElectionState::Participant);
@@ -1127,7 +1141,7 @@ fn chatter_loop(node_state: Arc<NodeState>) {
                     if ldr_uuid < self_uuid {
                         if let Some(next_uuid) = get_next_uuid(node_state.clone(),
                                                                &self_uuid) {
-                            info!("ELECTION: detected invalid leader, initiating election");
+                            info!("detected invalid leader, initiating election");
                             set_election_state(node_state.clone(),
                                                Leadership::LeaderUnknown,
                                                ElectionState::Participant);
@@ -1139,7 +1153,7 @@ fn chatter_loop(node_state: Arc<NodeState>) {
                 (_, ElectionState::Participant) => {
                     election_counter += 1;
                     if election_counter > 3 {
-                        info!("ELECTION: too long in election phase, restarting election process");
+                        info!("too long in election phase, restarting election process");
                         forget_leader(node_state.clone());
                         election_counter = 0;
                     }

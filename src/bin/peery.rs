@@ -70,31 +70,30 @@ fn handler(msg: Message) {
 
 fn run(config: Config) {
     let conf = Arc::new(config);
-    let lock_dir_path = Path::new(&conf.workspace_dir).join("lock");
-    match DirBuilder::new().create(&lock_dir_path) {
-        Ok(()) => {
-            match NodeState::new(conf.clone()) {
-                Ok(node_state) => {
+    match NodeState::new(conf.clone()) {
+        Ok(node_state) => {
+            let lock_dir_path = Path::new(&conf.workspace_dir).join("lock");
+            match DirBuilder::new().create(&lock_dir_path) {
+                Ok(()) => {
                     let ns = Arc::new(node_state);
                     start_networking(ns.clone(), handler);
                     repl(conf, ns);
-                    ()
+                    match remove_dir(&lock_dir_path) {
+                        Ok(()) => {},
+                        Err(e) => {
+                            println!("could not remove lock directory `{:?}': {}", lock_dir_path, e);
+                        }
+                    }
                 },
-                Err(e) =>
-                    println!("cannot create node state: {}", e)
-            }
-            match remove_dir(&lock_dir_path) {
-                Ok(()) => {},
                 Err(e) => {
-                    println!("could not remove lock directory `{:?}': {}", lock_dir_path, e);
+                    println!("Could not create lock directory: {}", e);
+                    println!("Maybe an instance is already running?");
+                    println!("If not, remove `{:?}' and try again.", lock_dir_path);
                 }
             }
         },
-        Err(e) => {
-            println!("Could not create lock directory: {}", e);
-            println!("Maybe an instance is already running?");
-            println!("If not, remove `{:?}' and try again.", lock_dir_path);
-        }
+        Err(e) =>
+            println!("cannot create node state: {}", e)
     }
 }
 
