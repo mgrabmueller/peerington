@@ -42,24 +42,12 @@ impl Version {
     }
 }
 
-/// Newtype wrapper for a membership token.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Token(pub u64);
-
-impl fmt::Display for Token {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Token(v) => write!(f, "{}", v),
-        }
-    }
-}
-
-impl Token {
-    pub fn number(&self) -> u64 {
-        match *self {
-            Token(v) => v
-        }
-    }
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum MemberEvent {
+    // Node went up.
+    Up,
+    /// Node went down
+    Down,
 }
 
 /// Message type for inter-node communications.
@@ -105,6 +93,10 @@ pub enum Message {
     /// has selected a leader, this message announcing the UUID of the
     /// new leader is sent around the ring.
     Elected(Uuid),
+    /// An event that was detected and is sent around the ring.  It
+    /// contains the original sender, a time-to-live, the node the
+    /// event is about and the event itself.
+    NodeEvent(Uuid, u16, Uuid, MemberEvent),
 }
 
 impl Message {
@@ -198,6 +190,25 @@ impl Message {
                 try!(r.read_exact(&mut buf));
                 let uuid = try!(Uuid::from_bytes(&buf));
                 Ok(Message::Elected(uuid))
+            },
+            70 => {
+                let mut buf = [0; 16];
+
+                try!(r.read_exact(&mut buf));
+                let from_uuid = try!(Uuid::from_bytes(&buf));
+
+                let ttl = try!(r.read_u16::<BigEndian>());
+
+                try!(r.read_exact(&mut buf));
+                let about_uuid = try!(Uuid::from_bytes(&buf));
+                let tag = try!(r.read_u16::<BigEndian>());
+                let event =
+                    match tag {
+                        0 => MemberEvent::Up,
+                        1 => MemberEvent::Down,
+                        _ => return Err(error::Error::MessageParse("invalid member event tag")),
+                    };
+                Ok(Message::NodeEvent(from_uuid, ttl, about_uuid, event))
             },
             _ => {
                 Err(error::Error::MessageParse("invalid message tag"))
@@ -293,6 +304,21 @@ impl Message {
 
                 let buf = uuid.as_bytes();
                 try!(w.write(buf));
+                Ok(())
+            },
+            Message::NodeEvent(from_uuid, ttl, about_uuid, event) => {
+                try!(w.write_u8(70));
+                let buf = from_uuid.as_bytes();
+                try!(w.write(buf));
+                try!(w.write_u16::<BigEndian>(ttl));
+                let buf = about_uuid.as_bytes();
+                try!(w.write(buf));
+                let tag =
+                    match event {
+                        MemberEvent::Up => 0,
+                        MemberEvent::Down => 1,
+                    };
+                try!(w.write_u8(tag));
                 Ok(())
             },
         }

@@ -127,6 +127,8 @@ pub struct NodeState {
     pub networking: RwLock<bool>,
 }
 
+const RING_TTL: u16 = 100;
+
 impl NodeState {
     /// Create a new node state based on the given configuration.
     pub fn new(config: Arc<config::Config>) -> Result<NodeState, error::Error> {
@@ -285,7 +287,7 @@ fn verify_client_cert(preverify_ok: bool, x509_ctx: &x509::X509StoreContext) -> 
 pub fn send_message(node_state: Arc<node::NodeState>,
                     to: &Uuid,
                     message: message::Message) {
-    trace!("sending to {}: {:?}", to, message);
+//    info!("sending to {}: {:?}", to, message);
     let tx = node::find_send_channel(node_state.clone(), to);
     match tx {
         Some(tx) => {
@@ -324,18 +326,16 @@ pub fn send_message(node_state: Arc<node::NodeState>,
                                 }
                             }
                         } else {
-                            {
-                                let mut peers = node_state.peers.lock().unwrap();
-                                match peers.get_mut(&to) {
-                                    Some(peer) => {
-                                        peer.connect_errors += 1;
-                                        if peer.availability != Some(Availability::Down) {
-                                            peer.availability = Some(Availability::Down);
-                                            info!("node {} is down", to);
-                                        }
-                                    },
-                                    None => {}
-                                }
+                            let mut peers = node_state.peers.lock().unwrap();
+                            match peers.get_mut(&to) {
+                                Some(peer) => {
+                                    peer.connect_errors += 1;
+                                    if peer.availability != Some(Availability::Down) {
+                                        peer.availability = Some(Availability::Down);
+                                        info!("node {} is down", to);
+                                    }
+                                },
+                                None => {}
                             }
                         }
                     } else {
@@ -1002,6 +1002,21 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                     error!("cannot determine next node in ring");
                 }
             },
+            message::Message::NodeEvent(from_uuid, ttl, about_uuid, event) => {
+                info!("got informed that {} went {:?}", about_uuid, event);
+                if from_uuid != self_uuid && ttl > 0 {
+                    if let Some(next_uuid) = get_next_uuid(node_state.clone(),
+                                                           &self_uuid) {
+                        send_message(node_state.clone(),
+                                     &next_uuid,
+                                     message::Message::NodeEvent(
+                                         from_uuid,
+                                         ttl - 1,
+                                         about_uuid,
+                                         event));
+                    }
+                }
+            },
             _ => {
                 handler(d);
             }
@@ -1048,11 +1063,6 @@ pub fn stop_networking(node_state: Arc<node::NodeState>) {
     }
 }
 
-fn peer_availability(node_state: Arc<NodeState>, uuid: &Uuid) -> Option<Availability> {
-    let peers = node_state.peers.lock().unwrap();
-    peers.get(&uuid).and_then(|peer| peer.availability)
-}
-
 /// Return a list of all known UUIDs plus listen address.
 fn get_peer_uuids_and_addresses(node_state: Arc<NodeState>) -> Vec<(Uuid, String)> {
     let mut ret = Vec::new();
@@ -1063,6 +1073,16 @@ fn get_peer_uuids_and_addresses(node_state: Arc<NodeState>) -> Vec<(Uuid, String
         }
     }
     ret
+}
+
+/// Return a list of all known UUIDs.
+fn get_peer_uuids_with<F, P>(node_state: Arc<NodeState>, proj: F) -> Vec<(Uuid, P)>
+    where F: Fn(&PeerState) -> P
+{
+    let peers = node_state.peers.lock().unwrap();
+    peers.iter()
+        .map(|(u, ps)| (*u, proj(ps)))
+        .collect()
 }
 
 fn forget_leader(node_state: Arc<NodeState>) {
@@ -1101,25 +1121,53 @@ fn get_known_uuids(node_state: Arc<NodeState>) -> HashSet<Uuid> {
 /// Return the next UUID in the ring of all known UUIDs.
 fn get_next_uuid(node_state: Arc<NodeState>,
                  from_uuid: &Uuid) -> Option<Uuid> {
-    let mut uuids: Vec<_> = get_peer_uuids_and_addresses(node_state.clone())
+    let mut uuids: Vec<_> = get_peer_uuids_with(node_state.clone(),
+                                                |ps| ps.availability)
         .into_iter()
-        .map(|(u, _)| u)
-        .filter(|u| peer_availability(node_state.clone(), &u) != Some(Availability::Down))
+        .filter(|&(_, av)| av != Some(Availability::Down))
         .collect();
     if uuids.len() > 0 {
-        uuids.sort_by(|&a, &b| a.cmp(&b));
+        uuids.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
         let next_uuid =
             match uuids
             .iter()
-            .skip_while(|&a| a < from_uuid)
+            .skip_while(|&&(a, _)| a < *from_uuid)
             .next() {
-                None => uuids[0].clone(),
-                Some(u) => u.clone(),
+                None => uuids[0].0.clone(),
+                Some(u) => u.0.clone(),
             };
         Some(next_uuid)
     } else {
         None
     }
+}
+
+/// Return the next UUIDs in the ring, up to the first one which is
+/// not marked as down.
+fn get_next_uuids_with_availabilities(node_state: Arc<NodeState>,
+                 from_uuid: &Uuid) -> Vec<(Uuid, Option<Availability>)> {
+    let mut uuids: Vec<_> = get_peer_uuids_with(node_state.clone(),
+                                                |ps| ps.availability);
+
+    uuids.push((*from_uuid, None));
+    uuids.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
+
+    let ret = uuids.iter()
+        .chain(uuids.iter())
+        .skip_while(|&&(u, _)| u < *from_uuid)
+        .filter(|&&(u, _)| u != *from_uuid)
+        .scan(true,
+              |state, &(u, av)|
+              if *state {
+                  if av != Some(Availability::Down) {
+                      *state = false;
+                  }
+                  Some((u, av))
+              } else {
+                  None
+              })
+        .collect();
+    ret
 }
 
 fn set_election_state(node_state: Arc<NodeState>,
@@ -1143,8 +1191,34 @@ fn chatter_loop(node_state: Arc<NodeState>) {
     let self_uuid = node_state.config.uuid;
     while networking_enabled(node_state.clone()) {
         thread::sleep(time::Duration::from_millis(ITERATION_SLEEP_MS));
-        
-        let mut uuids = get_peer_uuids_and_addresses(node_state.clone());
+
+        if rng.gen::<u8>() % 100 < 10 {
+            let uuids = get_peer_uuids_with(node_state.clone(),
+                                            |ps| ps.availability);
+            info!("sending information about {:?}", uuids);
+            if let Some(next_uuid) = get_next_uuid(node_state.clone(),
+                                                   &self_uuid) {
+                for (u, av) in uuids {
+                    match av {
+                        None => {},
+                        Some(updown) => {
+                            send_message(node_state.clone(),
+                                         &next_uuid,
+                                         message::Message::NodeEvent(
+                                             self_uuid,
+                                             RING_TTL,
+                                             u,
+                                             match updown {
+                                                 Availability::Up => message::MemberEvent::Up,
+                                                 Availability::Down => message::MemberEvent::Down,
+                                             }));
+                        }
+                    }
+                }
+            }
+        }
+
+        let uuids = get_peer_uuids_and_addresses(node_state.clone());
 
         if uuids.len() > 0 {
             let es = get_election_state(node_state.clone());
@@ -1204,23 +1278,12 @@ fn chatter_loop(node_state: Arc<NodeState>) {
             }
         }
 
-        // FIXME: Need to periodically try to reconnect to down nodes.
-            
-        // Periodically, ping the node next in the ring.
-        let mut nuuids = Vec::new();
-        match get_next_uuid(node_state.clone(), &self_uuid) {
-            None => {},
-            Some(next_uuid) => {
-                nuuids.push(next_uuid);
-            }
-        }
-        rng.shuffle(nuuids.as_mut_slice());
-//        for &(u, _) in uuids.iter().take(2) {
-        for &u in nuuids.iter().take(2) {
-            let availability = {
-                let peers = node_state.peers.lock().unwrap();
-                peers.get(&u).and_then(|peer| peer.availability)
-            };
+        // Periodically, ping the node next in the ring.  We include
+        // all following nodes in the ring up to the first one we do
+        // consider to be up, in order to reconnect to nodes that come
+        // up again.
+        let nuuids = get_next_uuids_with_availabilities(node_state.clone(), &self_uuid);
+        for (u, availability) in nuuids {
             match availability {
                 None => {
                     if rng.gen::<u8>() % 100 < 50 {
@@ -1245,7 +1308,10 @@ fn chatter_loop(node_state: Arc<NodeState>) {
                         let peers = node_state.peers.lock().unwrap();
                         peers.get(&u).map(|peer| peer.connect_errors).unwrap_or(0)
                     };
-                    let prob = cmp::max(1, 100 / cmp::min(100, 2usize.pow(cmp::min(10, conn_err_cnt) as u32)));
+                    let prob = cmp::max(1,
+                                        100 / cmp::min(100,
+                                                       2usize.pow
+                                                       (cmp::min(10, conn_err_cnt) as u32)));
                     if rng.gen::<usize>() % 100 <= prob {
                         send_message(node_state.clone(), &u,
                                      message::Message::Ping(self_uuid))
