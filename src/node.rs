@@ -68,11 +68,20 @@ pub struct PeerState {
     /// Internal channel for sending messages to the node.
     pub send_channel: Option<SyncSender<message::Message>>,
 
+    /// Number of established sending connections.
+    pub send_conn_count: usize,
+
+    /// Number of established receivning connections.
+    pub recv_conn_count: usize,
+    
     /// Number of connection errors that have been detected.
     pub connect_errors: usize,
 
     /// Currently known availability of the node.
     pub availability: Option<Availability>,
+
+    /// Currently known availability of the node.
+    pub availability_info: Option<Availability>,
 
     /// Public listen addresses of the node.
     pub addresses: HashSet<String>,
@@ -564,12 +573,16 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                         .or_insert_with(|| PeerState{uuid: u,
                                                      proto_version_send: None,
                                                      proto_version_recv: None,
+                                                     send_conn_count: 0,
+                                                     recv_conn_count: 0,
                                                      connect_errors: 0,
                                                      send_channel: None,
                                                      availability: None,
+                                                     availability_info: None,
                                                      addresses: HashSet::new(),
                                                      });
                     pe.proto_version_recv = Some(proto_version);
+                    pe.recv_conn_count += 1;
                     if pe.availability != Some(Availability::Up) {
                         pe.availability = Some(Availability::Up);
                         info!("node {} is up", u);
@@ -582,6 +595,7 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                     let mut peers = node_state.peers.lock().unwrap();
                     if let Some(pe) = peers.get_mut(&u) {
                         pe.proto_version_recv = None;
+                        pe.recv_conn_count -= 1;
                     }
                 }
 
@@ -661,12 +675,16 @@ fn send_handler(node_state: Arc<node::NodeState>,
                         .or_insert_with(|| PeerState{uuid: u,
                                                      proto_version_send: None,
                                                      proto_version_recv: None,
+                                                     send_conn_count: 0,
+                                                     recv_conn_count: 0,
                                                      connect_errors: 0,
                                                      send_channel: None,
                                                      availability: None,
+                                                     availability_info: None,
                                                      addresses: HashSet::new(),
                                                      });
                     ps.proto_version_send = Some(proto_version);
+                    ps.send_conn_count += 1;
                     if ps.availability != Some(Availability::Up) {
                         ps.availability = Some(Availability::Up);
                         info!("node {} is up", u);
@@ -682,6 +700,7 @@ fn send_handler(node_state: Arc<node::NodeState>,
                 {
                     let mut peers = node_state.peers.lock().unwrap();
                     if let Some(ps) = peers.get_mut(&u) {
+                        ps.send_conn_count -= 1;
                         ps.proto_version_send = None;
                         ps.send_channel = None;
                     }
@@ -898,9 +917,12 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                             .or_insert_with(|| PeerState{uuid: u,
                                                          proto_version_send: None,
                                                          proto_version_recv: None,
+                                                         send_conn_count: 0,
+                                                         recv_conn_count: 0,
                                                          connect_errors: 0,
                                                          send_channel: None,
                                                          availability: None,
+                                                         availability_info: None,
                                                          addresses: HashSet::new(),
                                                          })
                             .addresses.insert(addr);
@@ -1002,18 +1024,45 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                     error!("cannot determine next node in ring");
                 }
             },
-            message::Message::NodeEvent(from_uuid, ttl, about_uuid, event) => {
-                info!("got informed that {} went {:?}", about_uuid, event);
+            message::Message::NodeInfo(from_uuid, ttl, items) => {
                 if from_uuid != self_uuid && ttl > 0 {
+                    {
+                        let mut peers = node_state.peers.lock().unwrap();
+                        for &message::NodeInfo{uuid: u, availability: av} in items.iter() {
+                            if u != self_uuid {
+                                let mut pe = peers.entry(u)
+                                    .or_insert_with(|| PeerState{uuid: u,
+                                                                 proto_version_send: None,
+                                                                 proto_version_recv: None,
+                                                                 send_conn_count: 0,
+                                                                 recv_conn_count: 0,
+                                                                 connect_errors: 0,
+                                                                 send_channel: None,
+                                                                 availability: None,
+                                                                 availability_info: None,
+                                                                 addresses: HashSet::new(),
+                                    });
+                                if av.is_some() {
+                                    if pe.availability_info != av {
+                                        if av == Some(Availability::Up) {
+                                            info!("node {} is reported up", u);
+                                        } else {
+                                            info!("node {} is reported down", u);
+                                        }
+                                        pe.availability_info = av;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if let Some(next_uuid) = get_next_uuid(node_state.clone(),
                                                            &self_uuid) {
                         send_message(node_state.clone(),
                                      &next_uuid,
-                                     message::Message::NodeEvent(
+                                     message::Message::NodeInfo(
                                          from_uuid,
                                          ttl - 1,
-                                         about_uuid,
-                                         event));
+                                         items));
                     }
                 }
             },
@@ -1056,10 +1105,13 @@ pub fn stop_networking(node_state: Arc<node::NodeState>) {
     forget_leader(node_state.clone());
     let mut peers = node_state.peers.lock().unwrap();
     for (_, p) in peers.iter_mut() {
+        p.send_conn_count = 0;
+        p.recv_conn_count = 0;
         p.proto_version_send = None;
         p.proto_version_recv = None;
         p.send_channel = None;
         p.availability = None;
+        p.availability_info = None;
     }
 }
 
@@ -1193,28 +1245,20 @@ fn chatter_loop(node_state: Arc<NodeState>) {
         thread::sleep(time::Duration::from_millis(ITERATION_SLEEP_MS));
 
         if rng.gen::<u8>() % 100 < 10 {
-            let uuids = get_peer_uuids_with(node_state.clone(),
-                                            |ps| ps.availability);
-            info!("sending information about {:?}", uuids);
+            let mut uuids = get_peer_uuids_with(node_state.clone(),
+                                                |ps| ps.availability);
+            uuids.push((self_uuid, Some(Availability::Up)));
             if let Some(next_uuid) = get_next_uuid(node_state.clone(),
                                                    &self_uuid) {
-                for (u, av) in uuids {
-                    match av {
-                        None => {},
-                        Some(updown) => {
-                            send_message(node_state.clone(),
-                                         &next_uuid,
-                                         message::Message::NodeEvent(
-                                             self_uuid,
-                                             RING_TTL,
-                                             u,
-                                             match updown {
-                                                 Availability::Up => message::MemberEvent::Up,
-                                                 Availability::Down => message::MemberEvent::Down,
-                                             }));
-                        }
-                    }
-                }
+                send_message(node_state.clone(),
+                             &next_uuid,
+                             message::Message::NodeInfo(
+                                 self_uuid,
+                                 RING_TTL,
+                                 uuids.into_iter()
+                                     .map(|(u, av)| message::NodeInfo{uuid: u,
+                                                                      availability: av})
+                                     .collect()))
             }
         }
 

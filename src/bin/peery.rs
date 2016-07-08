@@ -280,7 +280,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         Command::Peers => {
             match node_state.peers.lock() {
                 Ok(peers) => {
-                    println!(" # SL uuid                                     ce rver  sver state   listen");
+                    println!(" # SLio uuid                                     ce rver  sver state           listen");
                     let mut self_addrs = HashSet::new();
                     for a in &node_state.config.listen_addresses {
                         self_addrs.insert(a.clone());
@@ -289,9 +289,12 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                         { PeerState{uuid: node_state.config.uuid,
                                     proto_version_send: None,
                                     proto_version_recv: None,
+                                    send_conn_count: 0,
+                                    recv_conn_count: 0,
                                     connect_errors: 0,
                                     send_channel: None,
                                     availability: Some(Availability::Up),
+                                    availability_info: Some(Availability::Up),
                                     addresses: self_addrs,
                                     }
                         };
@@ -329,15 +332,22 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                             Some(Availability::Down) =>
                                 t.fg(term::color::RED).unwrap()
                         };
-                        println!("{:2} {}{} {} {:5} {:5} {:5} {:7} {:?}",
+                        println!("{:2} {}{}{}{} {} {:5} {:5} {:5} {:7} {:7} {:?}",
                                  idx,
                                  if is_self { "*" } else { " " },
                                  if is_leader { "L" } else { " " },
+                                 if peer_state.recv_conn_count > 0 { "i" } else {" "},
+                                 if peer_state.send_conn_count > 0 { "o" } else {" "},
                                  name,
                                  peer_state.connect_errors,
                                  peer_state.proto_version_recv.unwrap_or(Version(0)).number(),
                                  peer_state.proto_version_send.unwrap_or(Version(0)).number(),
                                  match peer_state.availability {
+                                     None => "unknown",
+                                     Some(Availability::Up) => "up",
+                                     Some(Availability::Down) => "down",
+                                 },
+                                 match peer_state.availability_info {
                                      None => "unknown",
                                      Some(Availability::Up) => "up",
                                      Some(Availability::Down) => "down",

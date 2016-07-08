@@ -13,6 +13,7 @@ use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
 
 use super::error;
+use super::node;
 
 /// Maximum supported inter-node protocol version that this version of
 /// the library supports.
@@ -42,12 +43,10 @@ impl Version {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum MemberEvent {
-    // Node went up.
-    Up,
-    /// Node went down
-    Down,
+#[derive(Debug)]
+pub struct NodeInfo {
+    pub uuid: Uuid,
+    pub availability: Option<node::Availability>,
 }
 
 /// Message type for inter-node communications.
@@ -96,7 +95,51 @@ pub enum Message {
     /// An event that was detected and is sent around the ring.  It
     /// contains the original sender, a time-to-live, the node the
     /// event is about and the event itself.
-    NodeEvent(Uuid, u16, Uuid, MemberEvent),
+    NodeInfo(Uuid, u16, Vec<NodeInfo>),
+}
+
+impl NodeInfo {
+    pub fn read<R: Read>(r: &mut R) -> Result<NodeInfo, error::Error>  {
+        let mut buf = [0; 16];
+        try!(r.read_exact(&mut buf));
+        let uuid = try!(Uuid::from_bytes(&buf));
+        let tag = try!(r.read_u8());
+        let availability =
+            match tag {
+                0 => None,
+                1 => {
+                    let tag = try!(r.read_u8());
+                    let av =
+                        match tag {
+                            0 => node::Availability::Down,
+                            1 => node::Availability::Up,
+                            _ => return Err(error::Error::MessageParse("invalid availability tag")),
+                        };
+                    Some(av)
+                },
+                _ => return Err(error::Error::MessageParse("invalid option tag")),
+            };
+        Ok(NodeInfo{uuid: uuid,
+                    availability: availability})
+    }
+    pub fn write<W: Write>(&self, w: &mut W) -> Result<(), error::Error> {
+        let buf = self.uuid.as_bytes();
+        try!(w.write(buf));
+        match self.availability {
+            None =>
+                try!(w.write_u8(0)),
+            Some(av) => {
+                try!(w.write_u8(1));
+                match av {
+                    node::Availability::Down =>
+                        try!(w.write_u8(0)),
+                    node::Availability::Up =>
+                        try!(w.write_u8(1)),
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Message {
@@ -199,16 +242,13 @@ impl Message {
 
                 let ttl = try!(r.read_u16::<BigEndian>());
 
-                try!(r.read_exact(&mut buf));
-                let about_uuid = try!(Uuid::from_bytes(&buf));
-                let tag = try!(r.read_u16::<BigEndian>());
-                let event =
-                    match tag {
-                        0 => MemberEvent::Up,
-                        1 => MemberEvent::Down,
-                        _ => return Err(error::Error::MessageParse("invalid member event tag")),
-                    };
-                Ok(Message::NodeEvent(from_uuid, ttl, about_uuid, event))
+                let item_count = try!(r.read_u16::<BigEndian>());
+                let mut items = Vec::new();
+                for _ in 0..item_count {
+                    let ni = try!(NodeInfo::read(r));
+                    items.push(ni);
+                }
+                Ok(Message::NodeInfo(from_uuid, ttl, items))
             },
             _ => {
                 Err(error::Error::MessageParse("invalid message tag"))
@@ -306,19 +346,17 @@ impl Message {
                 try!(w.write(buf));
                 Ok(())
             },
-            Message::NodeEvent(from_uuid, ttl, about_uuid, event) => {
+            Message::NodeInfo(from_uuid, ttl, ref items) => {
                 try!(w.write_u8(70));
                 let buf = from_uuid.as_bytes();
                 try!(w.write(buf));
                 try!(w.write_u16::<BigEndian>(ttl));
-                let buf = about_uuid.as_bytes();
-                try!(w.write(buf));
-                let tag =
-                    match event {
-                        MemberEvent::Up => 0,
-                        MemberEvent::Down => 1,
-                    };
-                try!(w.write_u8(tag));
+                
+                assert!(items.len() <= (u16::MAX as usize));
+                try!(w.write_u16::<BigEndian>(items.len() as u16));
+                for i in 0..items.len() {
+                    try!(items[i].write(w));
+                }
                 Ok(())
             },
         }
