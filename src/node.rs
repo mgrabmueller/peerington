@@ -138,6 +138,8 @@ pub struct NodeState {
 
 const RING_TTL: u16 = 100;
 
+const MESSAGE_LIMIT_PER_CONN: usize = 1000;
+
 impl NodeState {
     /// Create a new node state based on the given configuration.
     pub fn new(config: Arc<config::Config>) -> Result<NodeState, error::Error> {
@@ -322,6 +324,7 @@ pub fn send_message(node_state: Arc<node::NodeState>,
                                 if peer.availability != Some(Availability::Up) {
                                     info!("node {} is up", to);
                                     peer.availability = Some(Availability::Up);
+                                    peer.availability_info = Some(Availability::Up);
                                 }
                             }
                             let tx = node::find_send_channel(node_state, to);
@@ -341,6 +344,7 @@ pub fn send_message(node_state: Arc<node::NodeState>,
                                     peer.connect_errors += 1;
                                     if peer.availability != Some(Availability::Down) {
                                         peer.availability = Some(Availability::Down);
+                                        peer.availability_info = Some(Availability::Down);
                                         info!("node {} is down", to);
                                     }
                                 },
@@ -468,7 +472,9 @@ fn recv_handler_loop(node_state: Arc<NodeState>,
                      msg: &mut Vec<u8>,
                      _proto_version: message::Version,
                      sender: SyncSender<message::Message>) {
-    while networking_enabled(node_state.clone()) {
+    let mut x = MESSAGE_LIMIT_PER_CONN;
+    while x > 0 && networking_enabled(node_state.clone()) {
+        x -= 1;
         match read_message(stream, msg) {
             Ok((message, rest)) => {
                 *msg = rest;
@@ -493,7 +499,9 @@ fn send_handler_loop(node_state: Arc<NodeState>,
                      stream: &mut ssl::SslStream<TcpStream>,
                      _proto_version: message::Version,
                      rx: Receiver<message::Message>) {
-    while networking_enabled(node_state.clone()) {
+    let mut x = MESSAGE_LIMIT_PER_CONN;
+    while x > 0 && networking_enabled(node_state.clone()) {
+        x -= 1;
         match rx.recv() {
             Ok(msg) => {
                 match write_message(stream, msg) {
@@ -585,6 +593,7 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                     pe.recv_conn_count += 1;
                     if pe.availability != Some(Availability::Up) {
                         pe.availability = Some(Availability::Up);
+                        pe.availability_info = Some(Availability::Up);
                         info!("node {} is up", u);
                     }
                 }
@@ -596,6 +605,10 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                     if let Some(pe) = peers.get_mut(&u) {
                         pe.proto_version_recv = None;
                         pe.recv_conn_count -= 1;
+                        if pe.recv_conn_count + pe.send_conn_count == 0 {
+                            pe.availability = Some(Availability::Down);
+                            pe.availability_info = Some(Availability::Down);
+                        }
                     }
                 }
 
@@ -605,6 +618,7 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                         forget_leader(node_state.clone());
                     }
                 }
+
                 trace!("{} ({}) disconnected", u, peer);
             }
             None => {
@@ -687,6 +701,7 @@ fn send_handler(node_state: Arc<node::NodeState>,
                     ps.send_conn_count += 1;
                     if ps.availability != Some(Availability::Up) {
                         ps.availability = Some(Availability::Up);
+                        ps.availability_info = Some(Availability::Up);
                         info!("node {} is up", u);
                     }
                     ps.send_channel = Some(tx);
@@ -703,6 +718,10 @@ fn send_handler(node_state: Arc<node::NodeState>,
                         ps.send_conn_count -= 1;
                         ps.proto_version_send = None;
                         ps.send_channel = None;
+                        if ps.recv_conn_count + ps.send_conn_count == 0 {
+                            ps.availability = Some(Availability::Down);
+                            ps.availability_info = Some(Availability::Down);
+                        }
                     }
                 }
                 if let Some(cur_leader) = current_leader(node_state.clone()) {
@@ -1026,8 +1045,12 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
             },
             message::Message::NodeInfo(from_uuid, ttl, items) => {
                 if from_uuid != self_uuid && ttl > 0 {
+                    let mut test_uuids = Vec::new();
+
+                    // Restrict locking of node_state.peers.
                     {
                         let mut peers = node_state.peers.lock().unwrap();
+                        
                         for &message::NodeInfo{uuid: u, availability: av} in items.iter() {
                             if u != self_uuid {
                                 let mut pe = peers.entry(u)
@@ -1051,9 +1074,19 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                                         }
                                         pe.availability_info = av;
                                     }
+                                    if pe.availability.is_some() &&
+                                        pe.availability != av
+                                    {
+                                        test_uuids.push(u);
+                                    }
                                 }
                             }
                         }
+                    }
+                    for uu in test_uuids.into_iter() {
+                        send_message(node_state.clone(),
+                                     &uu,
+                                     message::Message::Ping(self_uuid))
                     }
                     if let Some(next_uuid) = get_next_uuid(node_state.clone(),
                                                            &self_uuid) {
