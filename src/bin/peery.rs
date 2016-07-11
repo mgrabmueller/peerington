@@ -17,15 +17,10 @@ use peerington::node::Availability;
 use peerington::node::Leadership;
 use peerington::node::ElectionState;
 use peerington::node::start_networking;
-use peerington::node::stop_networking;
-use peerington::node::networking_enabled;
-use peerington::node::send_message;
 use peerington::node::get_election_state;
 use peerington::node::current_leader;
 use peerington::message::Message;
 use peerington::message::Version;
-
-use uuid::Uuid;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -59,9 +54,6 @@ fn main() {
 
 fn handler(msg: Message) {
     match msg {
-        Message::Broadcast(msg) => {
-            println!("broadcast: {}", msg);
-        },
         _ => {
             println!("error: unknown message: {:?}", msg)
         }
@@ -105,14 +97,10 @@ enum Command {
     Help,
     /// Print node state
     State,
-    /// Send a message to a specific node.
-    Send(Uuid, String),
     /// Show configuration.
     Config,
     /// Show information on all known peers.
     Peers,
-    /// Switch on/off networking.
-    Network(bool),
 }
 
 impl fmt::Display for Command {
@@ -124,14 +112,10 @@ impl fmt::Display for Command {
                 write!(f, "help"),
             Command::State =>
                 write!(f, "state"),
-            Command::Send(ref u, ref s) =>
-                write!(f, "send {} {}", u, s),
             Command::Config =>
                 write!(f, "config"),
             Command::Peers =>
                 write!(f, "peers"),
-            Command::Network(on) =>
-                write!(f, "network {}", if on { "on" } else { "off" }),
         }
     }
 }
@@ -151,32 +135,6 @@ impl Command {
                     Ok(Command::Config),
                 "p" | "peers" =>
                     Ok(Command::Peers),
-                "send" => {
-                    if tokens.len() > 2 {
-                        if let Ok(u) = Uuid::parse_str(tokens[1]) {
-                            let msg = tokens[2];
-                            Ok(Command::Send(u, msg.to_string()))
-                        } else {
-                            Err(CommandParseError::Syntax("send UUID MSG"))
-                        }
-                    } else {
-                        Err(CommandParseError::Syntax("send UUID MSG"))
-                    }
-                },
-                "network" => {
-                    if tokens.len() == 2 {
-                        match tokens[1] {
-                            "on" =>
-                                Ok(Command::Network(true)),
-                            "off" =>
-                                Ok(Command::Network(false)),
-                            _ =>
-                                Err(CommandParseError::Syntax("network on|off")),
-                        }
-                    } else {
-                        Err(CommandParseError::Syntax("network on|off"))
-                    }
-                },
                 _ =>  {
                     Err(CommandParseError::UnknownCommand(tokens[0]))
                 },
@@ -258,11 +216,6 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
             println!("  config            display the node configuration");
             println!("  state             display the state of this node");
             println!("  network on|off    enable/disable networking on this node");
-        },
-        Command::Send(uuid, msg) => {
-            println!("sending...");
-            send_message(node_state, &uuid, Message::Broadcast(msg));
-            println!("sent.");
         },
         Command::Config => {
             let config = &node_state.config;
@@ -366,12 +319,6 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         Command::State => {
             let (leadership, election_state) = get_election_state(node_state.clone());
             println!("uuid:       {}", node_state.config.uuid);
-            println!("networking: {}",
-                     if networking_enabled(node_state.clone()) {
-                         "on"
-                     } else {
-                         "off"
-                     });
             println!("leader:     {} {}",
                      match leadership {
                          Leadership::SelfLeader => format!("{}", node_state.config.uuid),
@@ -382,23 +329,6 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                          ElectionState::Participant => "(election in progress)",
                          ElectionState::NonParticipant => "",
                      });
-        },
-        Command::Network(on) => {
-            if on {
-                if !networking_enabled(node_state.clone()) {
-                    start_networking(node_state.clone(), handler);
-                    println!("networking is now enabled");
-                } else {
-                    println!("networking already enabled");
-                }
-            } else {
-                if networking_enabled(node_state.clone()) {
-                    stop_networking(node_state.clone());
-                    println!("networking is now disabled");
-                } else {
-                    println!("networking already disabled");
-                }
-            }
         },
         Command::Quit => {
             // Should be handled in caller.

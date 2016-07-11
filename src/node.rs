@@ -131,14 +131,9 @@ pub struct NodeState {
 
     /// State about ongoing leadership exceptions.
     pub election_state: RwLock<(Leadership, ElectionState)>,
-
-    /// Is networking enabled for this node?
-    pub networking: RwLock<bool>,
 }
 
 const RING_TTL: u16 = 100;
-
-const MESSAGE_LIMIT_PER_CONN: usize = 1000;
 
 impl NodeState {
     /// Create a new node state based on the given configuration.
@@ -177,7 +172,6 @@ impl NodeState {
             peers: Mutex::new(peers),
             election_state: RwLock::new((Leadership::LeaderUnknown,
                                          ElectionState::NonParticipant)),
-            networking: RwLock::new(false),
         })
     }
 }
@@ -467,14 +461,12 @@ fn send_negotiate_version(stream: &mut ssl::SslStream<TcpStream>) ->
 
 /// Loop reading data from a connected node, decoding messages and
 /// forwarding them to the given channel.
-fn recv_handler_loop(node_state: Arc<NodeState>,
+fn recv_handler_loop(_node_state: Arc<NodeState>,
                      stream: &mut ssl::SslStream<TcpStream>,
                      msg: &mut Vec<u8>,
                      _proto_version: message::Version,
                      sender: SyncSender<message::Message>) {
-    let mut x = MESSAGE_LIMIT_PER_CONN;
-    while x > 0 && networking_enabled(node_state.clone()) {
-        x -= 1;
+    loop {
         match read_message(stream, msg) {
             Ok((message, rest)) => {
                 *msg = rest;
@@ -495,13 +487,11 @@ fn recv_handler_loop(node_state: Arc<NodeState>,
 
 /// This loop repeatedly takes messages from the given Receiver,
 /// encodes them and sends them over the connection.
-fn send_handler_loop(node_state: Arc<NodeState>,
+fn send_handler_loop(_node_state: Arc<NodeState>,
                      stream: &mut ssl::SslStream<TcpStream>,
                      _proto_version: message::Version,
                      rx: Receiver<message::Message>) {
-    let mut x = MESSAGE_LIMIT_PER_CONN;
-    while x > 0 && networking_enabled(node_state.clone()) {
-        x -= 1;
+    loop {
         match rx.recv() {
             Ok(msg) => {
                 match write_message(stream, msg) {
@@ -743,9 +733,6 @@ fn accept_loop(node_state: Arc<node::NodeState>,
                sender: SyncSender<message::Message>,
                listener: TcpListener) {
     for stream in listener.incoming() {
-        if !networking_enabled(node_state.clone()) {
-            break;
-        }
         match stream {
             Ok(stream) => {
                 let ns = node_state.clone();
@@ -806,39 +793,35 @@ fn listener(node_state: Arc<node::NodeState>,
 /// Connect to the given address, using the context to establish a TLS
 /// connection.  Call the handler function when connected.
 fn connect_to_node(node_state: Arc<node::NodeState>, addr: &String) -> bool {
-    if networking_enabled(node_state.clone()) {
-        match TcpStream::connect(addr.as_str()) {
-            Err(e) => {
-                trace!("cannot connect to {}: {}", addr, e);
-                false
-            },
-            Ok(stream) => {
-                match ssl::Ssl::new(&node_state.ssl_context) {
-                    Err(e) => {
-                        error!("cannot create ssl context: {}", e);
-                        false
-                    },
-                    Ok(ssl) => {
-                        match ssl::SslStream::connect(ssl, stream) {
-                            Err(e) => {
-                                error!("cannot establish ssl connection: {}", e);
-                                false
-                            },
-                            Ok(mut ssl_stream) => {
-                                let (handshake_tx, handshake_rx) = sync_channel(0);
-                                thread::spawn(move || {
-                                    send_handler(node_state, &mut ssl_stream, handshake_tx);
-                                });
-                                let () = handshake_rx.recv().unwrap();
-                                true
-                            }
+    match TcpStream::connect(addr.as_str()) {
+        Err(e) => {
+            trace!("cannot connect to {}: {}", addr, e);
+            false
+        },
+        Ok(stream) => {
+            match ssl::Ssl::new(&node_state.ssl_context) {
+                Err(e) => {
+                    error!("cannot create ssl context: {}", e);
+                    false
+                },
+                Ok(ssl) => {
+                    match ssl::SslStream::connect(ssl, stream) {
+                        Err(e) => {
+                            error!("cannot establish ssl connection: {}", e);
+                            false
+                        },
+                        Ok(mut ssl_stream) => {
+                            let (handshake_tx, handshake_rx) = sync_channel(0);
+                            thread::spawn(move || {
+                                send_handler(node_state, &mut ssl_stream, handshake_tx);
+                            });
+                            let () = handshake_rx.recv().unwrap();
+                            true
                         }
                     }
                 }
             }
         }
-    } else {
-        false
     }
 }
 
@@ -887,10 +870,6 @@ fn make_node_message(node_state: Arc<NodeState>,
     message::Message::Nodes(leader, us)
 }
 
-pub fn networking_enabled(node_state: Arc<NodeState>) -> bool {
-    *node_state.networking.read().unwrap()
-}
-
 /// All incoming messages are handled in this loop. Messages for
 /// cluster and peer handling are handled directly by modifying the
 /// node states, other messages are passed to the given handler.
@@ -901,7 +880,7 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
 {
     let self_uuid = node_state.config.uuid;
 
-    while networking_enabled(node_state.clone()) {
+    loop {
         let d = receiver.recv().unwrap();
 //        trace!("msg_recv_loop: {:?}", d);
         match d {
@@ -1115,8 +1094,6 @@ pub fn start_networking<Handler>(node_state: Arc<node::NodeState>,
                         handler: Handler)
     where Handler: Fn(message::Message) -> () + Send + 'static
 {
-    *node_state.networking.write().unwrap() = true;
-
     // Create a channel for receiving messages. All threads handling
     // incoming connections will send parsed messages to this channel.
     let (sender, receiver) = sync_channel(1000);
@@ -1131,21 +1108,6 @@ pub fn start_networking<Handler>(node_state: Arc<node::NodeState>,
     thread::spawn(move || {
         chatter_loop(node_state_clone);
     });
-}
-
-pub fn stop_networking(node_state: Arc<node::NodeState>) {
-    *node_state.networking.write().unwrap() = false;
-    forget_leader(node_state.clone());
-    let mut peers = node_state.peers.lock().unwrap();
-    for (_, p) in peers.iter_mut() {
-        p.send_conn_count = 0;
-        p.recv_conn_count = 0;
-        p.proto_version_send = None;
-        p.proto_version_recv = None;
-        p.send_channel = None;
-        p.availability = None;
-        p.availability_info = None;
-    }
 }
 
 /// Return a list of all known UUIDs plus listen address.
@@ -1274,7 +1236,8 @@ fn chatter_loop(node_state: Arc<NodeState>) {
     let mut election_counter = 0;
 
     let self_uuid = node_state.config.uuid;
-    while networking_enabled(node_state.clone()) {
+
+    loop {
         thread::sleep(time::Duration::from_millis(ITERATION_SLEEP_MS));
 
         if rng.gen::<u8>() % 100 < 10 {

@@ -70,8 +70,6 @@ pub enum Message {
     /// the first message sent when connecting to a listening node and
     /// may be sent again during the lifetime of a connection.
     Hello(Uuid, Vec<String>),
-    /// A simple text transmission message, used for debugging.
-    Broadcast(String),
     /// A periodic heartbeat message.  The included UUID is the id of
     /// the sender.
     Ping(Uuid),
@@ -175,13 +173,6 @@ impl Message {
                     addrs.push(addr);
                 }
                 Ok(Message::Hello(uuid, addrs))
-            },
-            20 => {
-                let msg_len = try!(r.read_u16::<BigEndian>());
-                let mut v = vec![0; msg_len as usize];
-                try!(r.read_exact(&mut v));
-                let msg = try!(String::from_utf8(v));
-                Ok(Message::Broadcast(msg))
             },
             30 => {
                 let mut buf = [0; 16];
@@ -288,13 +279,6 @@ impl Message {
                     try!(w.write_u16::<BigEndian>(addrs[i].len() as u16));
                     try!(w.write(addrs[i].as_bytes()));
                 }
-                Ok(())
-            },
-            Message::Broadcast(ref msg) => {
-                try!(w.write_u8(20));
-                assert!(msg.len() <= (u16::MAX as usize));
-                try!(w.write_u16::<BigEndian>(msg.len() as u16));
-                try!(w.write(msg.as_bytes()));
                 Ok(())
             },
             Message::Ping(uuid) => {
