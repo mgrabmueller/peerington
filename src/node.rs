@@ -598,13 +598,14 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                         if pe.recv_conn_count + pe.send_conn_count == 0 {
                             pe.availability = Some(Availability::Down);
                             pe.availability_info = Some(Availability::Down);
+                            info!("node {} is down", u);
                         }
                     }
                 }
 
                 if let Some(cur_leader) = current_leader(node_state.clone()) {
                     if cur_leader == u {
-                        info!("current leader disconnected");
+                        info!("current leader {} disconnected", u);
                         forget_leader(node_state.clone());
                     }
                 }
@@ -711,12 +712,13 @@ fn send_handler(node_state: Arc<node::NodeState>,
                         if ps.recv_conn_count + ps.send_conn_count == 0 {
                             ps.availability = Some(Availability::Down);
                             ps.availability_info = Some(Availability::Down);
+                            info!("node {} is down", u);
                         }
                     }
                 }
                 if let Some(cur_leader) = current_leader(node_state.clone()) {
                     if cur_leader == u {
-                        info!("current leader disconnected");
+                        info!("current leader {} disconnected", u);
                         forget_leader(node_state.clone());
                     }
                 }
@@ -1240,12 +1242,12 @@ fn chatter_loop(node_state: Arc<NodeState>) {
     loop {
         thread::sleep(time::Duration::from_millis(ITERATION_SLEEP_MS));
 
-        if rng.gen::<u8>() % 100 < 10 {
+        {
             let mut uuids = get_peer_uuids_with(node_state.clone(),
                                                 |ps| ps.availability);
-            uuids.push((self_uuid, Some(Availability::Up)));
             if let Some(next_uuid) = get_next_uuid(node_state.clone(),
                                                    &self_uuid) {
+                uuids.push((self_uuid, Some(Availability::Up)));
                 send_message(node_state.clone(),
                              &next_uuid,
                              message::Message::NodeInfo(
@@ -1290,7 +1292,7 @@ fn chatter_loop(node_state: Arc<NodeState>) {
                 },
                 (_, ElectionState::Participant) => {
                     election_counter += 1;
-                    if election_counter > 3 + (rng.gen::<u8>() % 5) {
+                    if election_counter > 5 {
                         info!("too long in election phase, restarting election process");
                         forget_leader(node_state.clone());
                         election_counter = 0;
@@ -1312,10 +1314,8 @@ fn chatter_loop(node_state: Arc<NodeState>) {
             }
         };
         if let Some(ldr_uuid) = mb_ldr {
-            if rng.gen::<u8>() % 100 < 50 {
-                send_message(node_state.clone(), &ldr_uuid,
-                             message::Message::Ping(self_uuid))
-            }
+            send_message(node_state.clone(), &ldr_uuid,
+                         message::Message::Ping(self_uuid))
         }
 
         // Periodically, ping the node next in the ring.  We include
@@ -1348,7 +1348,7 @@ fn chatter_loop(node_state: Arc<NodeState>) {
                         let peers = node_state.peers.lock().unwrap();
                         peers.get(&u).map(|peer| peer.connect_errors).unwrap_or(0)
                     };
-                    let prob = cmp::max(1,
+                    let prob = cmp::max(10,
                                         100 / cmp::min(100,
                                                        2usize.pow
                                                        (cmp::min(10, conn_err_cnt) as u32)));
