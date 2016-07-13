@@ -233,7 +233,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         Command::Peers => {
             match node_state.peers.lock() {
                 Ok(peers) => {
-                    println!(" # SLio uuid                                     ce rver  sver state           listen");
+                    println!(" # SLio uuid                                 ce rver sver state listen");
                     let mut self_addrs = HashSet::new();
                     for a in &node_state.config.listen_addresses {
                         self_addrs.insert(a.clone());
@@ -266,7 +266,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                         let is_self = *name == self_peer_state.uuid;
                         let is_leader = Some(*name) == current_leader(node_state.clone());
 
-                        match peer_state.availability {
+                        match peer_state.availability_info {
                             None => {
                                 t.fg(term::color::BRIGHT_BLACK).unwrap();
                                 if is_leader {
@@ -285,7 +285,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                             Some(Availability::Down) =>
                                 t.fg(term::color::RED).unwrap()
                         };
-                        println!("{:2} {}{}{}{} {} {:5} {:5} {:5} {:7} {:7} {:?}",
+                        println!("{:2} {}{}{}{} {} {:2} {:4} {:4} {:1} {:3} {:?}",
                                  idx,
                                  if is_self { "*" } else { " " },
                                  if is_leader { "L" } else { " " },
@@ -296,14 +296,14 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                                  peer_state.proto_version_recv.unwrap_or(Version(0)).number(),
                                  peer_state.proto_version_send.unwrap_or(Version(0)).number(),
                                  match peer_state.availability {
-                                     None => "unknown",
-                                     Some(Availability::Up) => "up",
-                                     Some(Availability::Down) => "down",
+                                     None => "?",
+                                     Some(Availability::Up) => "\u{2714}",
+                                     Some(Availability::Down) => "\u{2718}",
                                  },
                                  match peer_state.availability_info {
-                                     None => "unknown",
-                                     Some(Availability::Up) => "up",
-                                     Some(Availability::Down) => "down",
+                                     None => "?",
+                                     Some(Availability::Up) => "\u{2714}",
+                                     Some(Availability::Down) => "\u{2718}",
                                  },
                                  peer_state.addresses
                         );
