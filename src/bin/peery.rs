@@ -238,20 +238,12 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                     for a in &node_state.config.listen_addresses {
                         self_addrs.insert(a.clone());
                     }
-                    let self_peer_state =
-                        { PeerState{uuid: node_state.config.uuid,
-                                    proto_version_send: None,
-                                    proto_version_recv: None,
-                                    send_conn_count: 0,
-                                    recv_conn_count: 0,
-                                    connect_errors: 0,
-                                    send_channel: None,
-                                    availability: Some(Availability::Up),
-                                    availability_info: Some(Availability::Up),
-                                    addresses: self_addrs,
-                                    message_received_at: 0,
-                                    }
-                        };
+                    let mut self_peer_state =
+                        PeerState::new(node_state.config.uuid);
+                    self_peer_state.availability = Some(Availability::Up);
+                    self_peer_state.availability_info = Some(Availability::Up);
+                    self_peer_state.addresses = self_addrs;
+                    
                     let mut ps = Vec::new();
                     for (name, peer_state) in &*peers {
                         ps.push((name, peer_state));
