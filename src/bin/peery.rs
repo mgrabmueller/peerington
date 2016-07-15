@@ -233,7 +233,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         Command::Peers => {
             match node_state.peers.lock() {
                 Ok(peers) => {
-                    println!(" # SLio uuid                                 ce rver sver state listen");
+                    println!(" # SLio uuid                                 ce rver sver state   active listen");
                     let mut self_addrs = HashSet::new();
                     for a in &node_state.config.listen_addresses {
                         self_addrs.insert(a.clone());
@@ -249,6 +249,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                                     availability: Some(Availability::Up),
                                     availability_info: Some(Availability::Up),
                                     addresses: self_addrs,
+                                    message_received_at: 0,
                                     }
                         };
                     let mut ps = Vec::new();
@@ -285,7 +286,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                             Some(Availability::Down) =>
                                 t.fg(term::color::RED).unwrap()
                         };
-                        println!("{:2} {}{}{}{} {} {:2} {:4} {:4} {:1} {:3} {:?}",
+                        println!("{:2} {}{}{}{} {} {:2} {:4} {:4} {:1} {:3} {:8} {:?}",
                                  idx,
                                  if is_self { "*" } else { " " },
                                  if is_leader { "L" } else { " " },
@@ -305,6 +306,7 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
                                      Some(Availability::Up) => "\u{2714}",
                                      Some(Availability::Down) => "\u{2718}",
                                  },
+                                 peer_state.message_received_at,
                                  peer_state.addresses
                         );
                         t.reset().unwrap();
@@ -318,7 +320,10 @@ fn execute(cmd: Command, node_state: Arc<NodeState>) {
         },
         Command::State => {
             let (leadership, election_state) = get_election_state(node_state.clone());
+            let time = { *node_state.time_counter.read().unwrap() };
+            
             println!("uuid:       {}", node_state.config.uuid);
+            println!("time:       {}", time);
             println!("leader:     {} {}",
                      match leadership {
                          Leadership::SelfLeader => format!("{}", node_state.config.uuid),

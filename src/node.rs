@@ -66,7 +66,7 @@ pub struct PeerState {
     pub proto_version_recv: Option<message::Version>,
 
     /// Internal channel for sending messages to the node.
-    pub send_channel: Option<SyncSender<message::Message>>,
+    pub send_channel: Option<SyncSender<Option<message::Message>>>,
 
     /// Number of established sending connections.
     pub send_conn_count: usize,
@@ -85,6 +85,9 @@ pub struct PeerState {
 
     /// Public listen addresses of the node.
     pub addresses: HashSet<String>,
+
+    /// Time counter when last message was received.
+    pub message_received_at: u64,
 }
 
 /// Whether the current node currently participates in an election
@@ -131,6 +134,10 @@ pub struct NodeState {
 
     /// State about ongoing leadership exceptions.
     pub election_state: RwLock<(Leadership, ElectionState)>,
+
+    /// Strictly monotonous counter. This is increased approximately
+    /// once a second, but intervals can be longer.
+    pub time_counter: RwLock<u64>,
 }
 
 const RING_TTL: u16 = 100;
@@ -172,6 +179,7 @@ impl NodeState {
             peers: Mutex::new(peers),
             election_state: RwLock::new((Leadership::LeaderUnknown,
                                          ElectionState::NonParticipant)),
+            time_counter: RwLock::new(1),
         })
     }
 }
@@ -201,7 +209,7 @@ pub fn remove_send_channel(node_state: Arc<node::NodeState>,
 /// Get the current active send channel for the node with the given
 /// UUID.
 pub fn find_send_channel(node_state: Arc<node::NodeState>,
-                         to: &Uuid) -> Option<SyncSender<message::Message>> {
+                         to: &Uuid) -> Option<SyncSender<Option<message::Message>>> {
     let peers = node_state.peers.lock().unwrap();
     if let Some(ps) = peers.get(&to) {
         match ps.send_channel {
@@ -296,7 +304,7 @@ pub fn send_message(node_state: Arc<node::NodeState>,
     let tx = node::find_send_channel(node_state.clone(), to);
     match tx {
         Some(tx) => {
-            match tx.send(message) {
+            match tx.send(Some(message)) {
                 Ok(()) =>
                     (),
                 Err(e) => {
@@ -324,7 +332,7 @@ pub fn send_message(node_state: Arc<node::NodeState>,
                             let tx = node::find_send_channel(node_state, to);
                             match tx {
                                 Some(tx) => {
-                                    tx.send(message).expect(
+                                    tx.send(Some(message)).expect(
                                         &format!("could not send internal message to {}", to))
                                 },
                                 None => {
@@ -490,10 +498,19 @@ fn recv_handler_loop(_node_state: Arc<NodeState>,
 fn send_handler_loop(_node_state: Arc<NodeState>,
                      stream: &mut ssl::SslStream<TcpStream>,
                      _proto_version: message::Version,
-                     rx: Receiver<message::Message>) {
+                     rx: Receiver<Option<message::Message>>) {
     loop {
         match rx.recv() {
-            Ok(msg) => {
+            Ok(None) => {
+                // None is used to signal a disconnect on a receiving
+                // socket.  We terminate the sending thread in this
+                // case, so that sending and receiving is somehow
+                // synchronized.  Note that a send error does *not*
+                // necessarily cause a termination for the receiving
+                // thread(s).
+                return;
+            },
+            Ok(Some(msg)) => {
                 match write_message(stream, msg) {
                     Ok(()) => {},
                     Err(e) => {
@@ -578,6 +595,7 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                                                      availability: None,
                                                      availability_info: None,
                                                      addresses: HashSet::new(),
+                                                     message_received_at: 0,
                                                      });
                     pe.proto_version_recv = Some(proto_version);
                     pe.recv_conn_count += 1;
@@ -610,6 +628,10 @@ fn recv_handler(node_state: Arc<node::NodeState>, stream: &mut ssl::SslStream<Tc
                     }
                 }
 
+                // Terminate sending thread, if there is one.
+                if let Some(tx) = node::find_send_channel(node_state.clone(), &u) {
+                    tx.send(None).unwrap();
+                }
                 trace!("{} ({}) disconnected", u, peer);
             }
             None => {
@@ -662,15 +684,15 @@ fn send_handler(node_state: Arc<node::NodeState>,
                 // message before any other message. We do this by sending
                 // before entering the sending part of the channel into
                 // the global map.
-                tx.send(message::Message::Hello(node_state.config.uuid,
-                                                node_state.config
-                                                .listen_addresses.clone())).unwrap();
+                tx.send(Some(message::Message::Hello(node_state.config.uuid,
+                                                     node_state.config
+                                                     .listen_addresses.clone()))).unwrap();
 
                 // Also, send a node message if we know about the ring.
                 let uuids = get_peer_uuids_and_addresses(node_state.clone());
                 if uuids.len() > 0 {
                     let node_msg = make_node_message(node_state.clone(), &uuids, &u, &node_state.config.uuid);
-                    tx.send(node_msg).unwrap();
+                    tx.send(Some(node_msg)).unwrap();
                 }
 
                 // Now that the connection was established
@@ -687,6 +709,7 @@ fn send_handler(node_state: Arc<node::NodeState>,
                                                      availability: None,
                                                      availability_info: None,
                                                      addresses: HashSet::new(),
+                                                     message_received_at: 0,
                                                      });
                     ps.proto_version_send = Some(proto_version);
                     ps.send_conn_count += 1;
@@ -872,6 +895,24 @@ fn make_node_message(node_state: Arc<NodeState>,
     message::Message::Nodes(leader, us)
 }
 
+fn got_message(node_state: Arc<NodeState>, sender: &Uuid) {
+    let mut peers = node_state.peers.lock().unwrap();
+    peers.entry(*sender)
+        .or_insert_with(|| PeerState{uuid: *sender,
+                                     proto_version_send: None,
+                                     proto_version_recv: None,
+                                     send_conn_count: 0,
+                                     recv_conn_count: 0,
+                                     connect_errors: 0,
+                                     send_channel: None,
+                                     availability: None,
+                                     availability_info: None,
+                                     addresses: HashSet::new(),
+                                     message_received_at: 0,
+        })
+        .message_received_at = *node_state.time_counter.read().unwrap();
+}
+
 /// All incoming messages are handled in this loop. Messages for
 /// cluster and peer handling are handled directly by modifying the
 /// node states, other messages are passed to the given handler.
@@ -897,14 +938,17 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                 }
                 let uuids = get_peer_uuids_and_addresses(node_state.clone());
                 let node_msg = make_node_message(node_state.clone(), &uuids, &u, &self_uuid);
-                send_message(node_state.clone(), &u, node_msg)
+                send_message(node_state.clone(), &u, node_msg);
+                got_message(node_state.clone(), &u);
             },
             message::Message::Ping(u) => {
                 let ns = node_state.clone();
                 send_message(ns, &u, message::Message::Pong(self_uuid));
+                got_message(node_state.clone(), &u);
             },
-            message::Message::Pong(_u) => {
+            message::Message::Pong(u) => {
                 // Do nothing for now.
+                got_message(node_state.clone(), &u);
             },
             message::Message::Nodes(mb_ldr, uuids) => {
                 let known_uuids = get_known_uuids(node_state.clone());
@@ -924,6 +968,7 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                                                          availability: None,
                                                          availability_info: None,
                                                          addresses: HashSet::new(),
+                                                         message_received_at: 0,
                                                          })
                             .addresses.insert(addr);
                     }
@@ -1045,6 +1090,7 @@ fn msg_recv_loop<Handler>(node_state: Arc<node::NodeState>,
                                                                  availability: None,
                                                                  availability_info: None,
                                                                  addresses: HashSet::new(),
+                                                                 message_received_at: 0,
                                     });
                                 if av.is_some() {
                                     if pe.availability_info != av {
@@ -1232,7 +1278,7 @@ pub fn get_election_state(node_state: Arc<NodeState>) -> (Leadership, ElectionSt
 }
 
 fn chatter_loop(node_state: Arc<NodeState>) {
-    const ITERATION_SLEEP_MS: u64 = 2000;
+    const ITERATION_SLEEP_MS: u64 = 1000;
     let mut rng = rand::thread_rng();
 
     let mut election_counter = 0;
@@ -1241,6 +1287,10 @@ fn chatter_loop(node_state: Arc<NodeState>) {
 
     loop {
         thread::sleep(time::Duration::from_millis(ITERATION_SLEEP_MS));
+
+        {
+            *node_state.time_counter.write().unwrap() += 1;
+        }
 
         {
             let mut uuids = get_peer_uuids_with(node_state.clone(),
