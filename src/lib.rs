@@ -15,3 +15,4 @@ pub mod error;
 pub mod config;
 pub mod node;
 pub mod message;
+pub mod raft;
