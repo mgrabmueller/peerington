@@ -35,7 +35,6 @@ use super::message;
 use super::config;
 use super::error;
 use super::node;
-use super::raft;
 
 /// Defines whether a node is considered up (available) or down
 /// (unavailable).  A node is marked as down when it is not possible
@@ -156,9 +155,6 @@ pub struct NodeState {
     /// Strictly monotonous counter. This is increased approximately
     /// once a second, but intervals can be longer.
     pub time_counter: RwLock<u64>,
-
-    /// Raft consensus state for this node.
-    pub raft_state: RwLock<raft::RaftState>,
 }
 
 const RING_TTL: u16 = 100;
@@ -194,8 +190,6 @@ impl NodeState {
                                Some(verify_client_cert));
 
         let peers = BTreeMap::new();
-        let uuid = config.uuid;
-        let state_dir = config.workspace_dir.clone();
         Ok(NodeState {
             config: config,
             ssl_context: ssl_context,
@@ -203,7 +197,6 @@ impl NodeState {
             election_state: RwLock::new((Leadership::LeaderUnknown,
                                          ElectionState::NonParticipant)),
             time_counter: RwLock::new(1),
-            raft_state: RwLock::new(raft::RaftState::new(uuid, state_dir)),
         })
     }
 }
